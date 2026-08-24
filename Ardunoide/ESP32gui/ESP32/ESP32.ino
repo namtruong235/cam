@@ -12,9 +12,9 @@ uint8_t robot8Mac[] = {
 };
 
 // ======================================================
-// ROBOT ID 9
+// ROBOT ID 7
 // ======================================================
-uint8_t robot9Mac[] = {
+uint8_t robot7Mac[] = {
     0x1C, 0x69, 0x20, 0xA4, 0xD0, 0x58
 };
 
@@ -133,8 +133,8 @@ const uint8_t* getRobotMac(int robotId)
     if (robotId == 8)
         return robot8Mac;
 
-    if (robotId == 9)
-        return robot9Mac;
+    if (robotId == 7)
+        return robot7Mac;
 
     if (robotId == 3)
         return robot3Mac;
@@ -268,7 +268,7 @@ void setup()
     }
 
     addPeer(robot8Mac, "ROBOT 8");
-    addPeer(robot9Mac, "ROBOT 9");
+    addPeer(robot7Mac, "ROBOT 9");
     addPeer(robot3Mac, "ROBOT 3");
 
     Serial.println();
@@ -282,8 +282,8 @@ void setup()
     Serial.print("R8  -> ");
     printMac(robot8Mac);
 
-    Serial.print("R9  -> ");
-    printMac(robot9Mac);
+    Serial.print("R7  -> ");
+    printMac(robot7Mac);
 
     Serial.print("R3  -> ");
     printMac(robot3Mac);
