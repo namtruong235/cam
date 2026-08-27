@@ -18,14 +18,14 @@ uint8_t robot7Mac[] = {
     0x1C, 0x69, 0x20, 0xA4, 0xD0, 0x58
 };
 
-// ======================================================
 // ROBOT ID 3
-//
-// CHUA CO MAC THU 3.
-// THAY 6 BYTE BEN DUOI BANG MAC ESP32 GAN ROBOT ID 3.
-// ======================================================
 uint8_t robot3Mac[] = {
     0x40, 0x22, 0xD8, 0x4F, 0x07, 0xE0
+};
+
+// ROBOT ID 29
+uint8_t robot29Mac[] = {
+    0x14, 0x33, 0x5C, 0x04, 0x61, 0x18
 };
 
 
@@ -40,13 +40,17 @@ uint8_t robot3Mac[] = {
 // Xoa diem dich:
 //   8;WPCLR#
 //
-//   9;START#
-//   9;STOP#
-//   9;420.8;80.1;271.6#
+//   7;START#
+//   7;STOP#
+//   7;420.8;80.1;271.6#
 //
 //   3;START#
 //   3;STOP#
 //   3;500.2;40.0;90.0#
+//
+//   29;START#
+//   29;STOP#
+//   29;510.0;60.0;180.0#
 //
 // Gateway doc ID dau packet, chon dung MAC,
 // sau do BO ID va gui phan con lai cho ESP32 tren robot.
@@ -138,6 +142,9 @@ const uint8_t* getRobotMac(int robotId)
 
     if (robotId == 3)
         return robot3Mac;
+
+    if (robotId == 29)
+        return robot29Mac;
 
     return nullptr;
 }
@@ -268,12 +275,13 @@ void setup()
     }
 
     addPeer(robot8Mac, "ROBOT 8");
-    addPeer(robot7Mac, "ROBOT 9");
+    addPeer(robot7Mac, "ROBOT 7");
     addPeer(robot3Mac, "ROBOT 3");
+    addPeer(robot29Mac, "ROBOT 29");
 
     Serial.println();
     Serial.println("====================================");
-    Serial.println("ESP32 GATEWAY - 3 ROBOT");
+    Serial.println("ESP32 GATEWAY - 4 ROBOT");
     Serial.println("====================================");
 
     Serial.print("MAC GATEWAY: ");
@@ -287,6 +295,9 @@ void setup()
 
     Serial.print("R3  -> ");
     printMac(robot3Mac);
+
+    Serial.print("R29 -> ");
+    printMac(robot29Mac);
 
     Serial.print("CHANNEL: ");
     Serial.println(ESPNOW_CHANNEL);
