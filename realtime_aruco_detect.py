@@ -1,13 +1,8 @@
-# ============================================================
-# THREE ROBOT VERSION
-# Robot 1: ArUco ID 8
-# Robot 2: ArUco ID 7
-# Robot 3: ArUco ID 3
+# FOUR ROBOT VERSION
+# Robot IDs: 8, 7, 3, 29
 # Serial packet: ID;X;Y;ANGLE#
-# Example: 8;352.4;64.7;43.2#9;420.8;80.1;271.6#
-# ============================================================
+# Example: 8;352.4;64.7;43.2#29;510.0;60.0;180.0#
 
-import queue
 import threading
 import math
 import time
@@ -19,9 +14,7 @@ import serial
 from concurrent.futures import ThreadPoolExecutor
 import builtins
 
-# ============================================================
 # CONSOLE LOG
-# ============================================================
 # Mặc định tắt toàn bộ console log để tránh I/O không cần thiết.
 # Khi cần debug có thể đổi thành True.
 ENABLE_CONSOLE_LOG = False
@@ -86,9 +79,33 @@ def transform_point_with_homography(point, matrix):
         x, y = result[0, 0]
         if not np.isfinite(x) or not np.isfinite(y):
             return None
-        return round(float(x), 1), round(float(y), 1)
+        return float(x), float(y)
     except cv2.error:
         return None
+
+
+def get_marker_center(marker_corner):
+    """Tâm ArUco = giao điểm hai đường chéo, giữ độ chính xác sub-pixel."""
+    pts = np.asarray(marker_corner, dtype=np.float64).reshape(4, 2)
+    tl, tr, br, bl = pts
+
+    r = br - tl
+    s = bl - tr
+    denominator = r[0] * s[1] - r[1] * s[0]
+
+    if abs(denominator) < 1e-9:
+        center = pts.mean(axis=0)
+    else:
+        q_minus_p = tr - tl
+        t = (q_minus_p[0] * s[1] - q_minus_p[1] * s[0]) / denominator
+        center = tl + t * r
+
+    if not np.all(np.isfinite(center)):
+        return None
+
+    return float(center[0]), float(center[1])
+
+
 def get_marker_world_angle(marker_corner, H):
     """
     Tính góc quay của marker trong hệ tọa độ thực.
@@ -168,22 +185,6 @@ def smooth_angle_deg(old_angle, new_angle, alpha=0.35):
     ) % 360.0
 
     return result
-
-def _put_latest(q, value):
-    """Chỉ giữ dữ liệu điều khiển mới nhất khi luồng Bluetooth đang tắt/chậm."""
-    try:
-        q.put_nowait(value)
-        return
-    except queue.Full:
-        pass
-    try:
-        q.get_nowait()
-    except queue.Empty:
-        pass
-    try:
-        q.put_nowait(value)
-    except queue.Full:
-        pass
 
 
 def _normalize_points_for_dlt(points):
@@ -358,19 +359,15 @@ def estimate_homography_checked(src_points, dst_points):
 
 # com_port = 'COM8'
 # baud_rate = 9600
-# ================= THEO DÕI 3 ROBOT =================
-# Robot 1 dùng ArUco ID 8, Robot 2 dùng ArUco ID 7.
-# ESP32 MAC 40:22:D8:4F:07:E0 nhận Robot ID 8.
-# ESP32 MAC 40:22:D8:3E:75:04 nhận Robot ID 7.
+# Robot IDs
 robot_id = 8
 robot2_id = 7
 robot3_id = 3
-ROBOT_IDS = {robot_id, robot2_id, robot3_id}
+robot4_id = 29
+ROBOT_IDS = {robot_id, robot2_id, robot3_id, robot4_id}
 
 # ser = serial.Serial(com_port, baud_rate, timeout=1)
-# ============================================================
 # ESP32 + DIEU KHIEN GUI
-# ============================================================
 
 com_port = 'COM19'
 baud_rate = 115200
@@ -381,18 +378,21 @@ ser = None
 serial_lock = threading.Lock()
 
 # Công tắc START / STOP riêng cho từng robot.
-# Ban đầu cả hai đều STOP.
+# Ban đầu tất cả đều STOP.
 send_robot8_enabled = threading.Event()
-send_robot9_enabled = threading.Event()
+send_robot7_enabled = threading.Event()
 send_robot3_enabled = threading.Event()
+send_robot29_enabled = threading.Event()
 
 def _send_event_for_robot(target_robot_id):
     if target_robot_id == robot_id:
         return send_robot8_enabled
     if target_robot_id == robot2_id:
-        return send_robot9_enabled
+        return send_robot7_enabled
     if target_robot_id == robot3_id:
         return send_robot3_enabled
+    if target_robot_id == robot4_id:
+        return send_robot29_enabled
     raise ValueError(f'Robot ID không hỗ trợ: {target_robot_id}')
 
 
@@ -409,6 +409,10 @@ robot_run_timers = {
         'started_at': None,
     },
     robot3_id: {
+        'accumulated': 0.0,
+        'started_at': None,
+    },
+    robot4_id: {
         'accumulated': 0.0,
         'started_at': None,
     },
@@ -437,35 +441,19 @@ def reset_robot_run_timer(target_robot_id):
     else:
         timer_info['started_at'] = None
 
-# Tọa độ cho GUI - lưu riêng cho 2 robot
+# Tọa độ cho GUI - lưu riêng cho 4 robot
 latest_x = None
 latest_y = None
 latest_x2 = None
 latest_y2 = None
 latest_x3 = None
 latest_y3 = None
+latest_x4 = None
+latest_y4 = None
 latest_xy_lock = threading.Lock()
 
-x_send = 0
-y_send = 0
 
-# Vẫn giữ queue = 1 vì mỗi phần tử queue sẽ chứa TOÀN BỘ packet mới nhất
-# của cả Robot ID 8, ID 7 và ID 3, ví dụ:
-#   8;352.4;64.7;43.2#9;420.8;80.1;271.6#3;500.2;40.0;90.0#
-shared_queue = queue.Queue(maxsize=1)
-
-# ============================================================
-# TRUYỀN SERIAL ĐỘC LẬP VỚI FPS CAMERA
-#
-# Camera/vision chỉ cập nhật "packet mới nhất".
-# Luồng Serial tự gửi ở tần số cố định, nên khi xử lý ảnh chậm hơn
-# một chút thì ESP32 vẫn nhận đều. Nếu chưa có tọa độ mới, packet
-# gần nhất sẽ được gửi lặp lại.
-#
-# Lưu ý:
-#   TX_TARGET_HZ = tần số truyền thông.
-#   Đây KHÔNG phải tần số tạo tọa độ mới nếu FPS vision thấp hơn.
-# ============================================================
+# Serial gửi fixed-rate, độc lập với FPS camera.
 TX_TARGET_HZ = 30.0
 TX_PERIOD_SEC = 1.0 / TX_TARGET_HZ
 
@@ -474,6 +462,7 @@ latest_robot_packets = {
     robot_id: None,
     robot2_id: None,
     robot3_id: None,
+    robot4_id: None,
 }
 
 
@@ -515,7 +504,7 @@ connect_serial()
 
 
 def handle_camera():
-    global latest_x, latest_y, latest_x2, latest_y2
+    global latest_x, latest_y, latest_x2, latest_y2, latest_x3, latest_y3, latest_x4, latest_y4
 
     # ================== TRẠM BƠM ẢNH ĐA LUỒNG ==================
     class CameraStream:
@@ -535,15 +524,22 @@ def handle_camera():
             return self
 
         def update(self):
-            # Liên tục hút ảnh từ USB vào RAM mà không làm nghẽn CPU
+            # Liên tục hút ảnh từ USB vào RAM. Một frame lỗi tạm thời không
+            # được phép làm thread camera dừng vĩnh viễn.
             while not self.stopped:
-                if not self.grabbed:
-                    self.stop()
+                grabbed, frame = self.stream.read()
+
+                if grabbed and frame is not None and frame.size > 0:
+                    self.grabbed = True
+                    self.frame = frame
                 else:
-                    (self.grabbed, self.frame) = self.stream.read()
+                    self.grabbed = False
+                    time.sleep(0.01)
 
         def read(self):
-            return self.grabbed, self.frame.copy() if self.grabbed else None
+            if not self.grabbed or self.frame is None or self.frame.size == 0:
+                return False, None
+            return True, self.frame.copy()
 
         def stop(self):
             self.stopped = True
@@ -554,7 +550,6 @@ def handle_camera():
     cam_stream = CameraStream(0).start()
     cam_stream2 = CameraStream(2).start()
     time.sleep(1)  # Chờ 1 giây cho luồng ổn định trước khi chạy tiếp
-    # ============================================================
 
     # ================= KHỞI TẠO HỆ TRỤC TỌA ĐỘ GỐC =================
     CAM1_WIDTH = 240  #
@@ -563,8 +558,6 @@ def handle_camera():
 
     # H Camera 2 -> hệ tọa độ thực (cm). Được tính khi bấm E và lưu ra file.
     matrix_cam2_to_real = None
-    img_points2 = None  # Chỉ giữ các inlier để chẩn đoán
-    real_points2 = None
     # TỌA ĐỘ PIXEL TRÊN MÀN HÌNH (Lấy chuẩn từ ảnh)
     img_points = np.array([
         (228, 288),  # Dưới-Trái -> GỐC TỌA ĐỘ O (0,0)
@@ -598,9 +591,6 @@ def handle_camera():
         except (OSError, pickle.PickleError, ValueError, TypeError) as exc:
             _debug_print(f'>>> Không thể nạp Homography cũ: {exc}')
 
-    # Gán tạm cho Cam 2 để không báo lỗi, sau này sẽ bị ghi đè bởi Ma trận
-
-    # ===============================================================
 
     positions_map = {}
     positions_map2 = {}
@@ -670,6 +660,24 @@ def handle_camera():
     robot3_speed_cm_s = 0.0
     robot3_last_motion_time = None
 
+    # ================= ROBOT 4 (ID 29) =================
+    robot4_filtered_position = None
+    robot4_filtered_angle = None
+    robot4_lost_frames = 0
+    robot4_source_label = 'NONE'
+
+    robot4_active_camera = None
+    robot4_active_missing_frames = 0
+    robot4_camera_offsets = {
+        'cam1': (0.0, 0.0),
+        'cam2': (0.0, 0.0),
+    }
+
+    robot4_path = []
+    robot4_total_distance_cm = 0.0
+    robot4_speed_cm_s = 0.0
+    robot4_last_motion_time = None
+
     start = time.time()
     num_frames = 0
     fps = 0
@@ -696,7 +704,7 @@ def handle_camera():
     )
     MAP_CANVAS_HEIGHT = 720
 
-    DASHBOARD_WINDOW = 'Dual Robot Tracking Dashboard PRO'
+    DASHBOARD_WINDOW = '4 Robot Tracking Dashboard PRO'
     HEADER_H = 82
     UI_PAD = 14
     MAP_VIEW_WIDTH = 1080
@@ -704,7 +712,7 @@ def handle_camera():
     SIDE_PANEL_WIDTH = 390
     SLIDER_H = 42
     DASHBOARD_WIDTH = UI_PAD + MAP_VIEW_WIDTH + UI_PAD + SIDE_PANEL_WIDTH + UI_PAD
-    DASHBOARD_HEIGHT = HEADER_H + UI_PAD + MAP_VIEW_HEIGHT + SLIDER_H + UI_PAD
+    DASHBOARD_HEIGHT = HEADER_H + UI_PAD + MAP_VIEW_HEIGHT + SLIDER_H + UI_PAD + 150
     BACKGROUND_MAX_SCROLL_X = max(0, MAP_CANVAS_WIDTH - MAP_VIEW_WIDTH)
 
     MAP_X = UI_PAD
@@ -736,35 +744,35 @@ def handle_camera():
     AXIS_COLOR = (74, 64, 55)
     MAP_TEXT = (112, 103, 94)
 
-    # Nút điều khiển RIÊNG cho 3 robot.
-    R8_START_BUTTON = (SIDE_X + 18, SIDE_Y + 252, SIDE_X + 128, SIDE_Y + 290)
-    R8_STOP_BUTTON  = (SIDE_X + 136, SIDE_Y + 252, SIDE_X + 246, SIDE_Y + 290)
-    R8_CLEAR_BUTTON = (SIDE_X + 254, SIDE_Y + 252, SIDE_X + 372, SIDE_Y + 290)
+    # Nút điều khiển riêng cho 4 robot.
+    R8_START_BUTTON = (SIDE_X + 18, SIDE_Y + 278, SIDE_X + 128, SIDE_Y + 316)
+    R8_STOP_BUTTON  = (SIDE_X + 136, SIDE_Y + 278, SIDE_X + 246, SIDE_Y + 316)
+    R8_CLEAR_BUTTON = (SIDE_X + 254, SIDE_Y + 278, SIDE_X + 372, SIDE_Y + 316)
 
-    R7_START_BUTTON = (SIDE_X + 18, SIDE_Y + 298, SIDE_X + 128, SIDE_Y + 336)
-    R7_STOP_BUTTON  = (SIDE_X + 136, SIDE_Y + 298, SIDE_X + 246, SIDE_Y + 336)
-    R7_CLEAR_BUTTON = (SIDE_X + 254, SIDE_Y + 298, SIDE_X + 372, SIDE_Y + 336)
+    R7_START_BUTTON = (SIDE_X + 18, SIDE_Y + 324, SIDE_X + 128, SIDE_Y + 362)
+    R7_STOP_BUTTON  = (SIDE_X + 136, SIDE_Y + 324, SIDE_X + 246, SIDE_Y + 362)
+    R7_CLEAR_BUTTON = (SIDE_X + 254, SIDE_Y + 324, SIDE_X + 372, SIDE_Y + 362)
 
-    R3_START_BUTTON = (SIDE_X + 18, SIDE_Y + 344, SIDE_X + 128, SIDE_Y + 382)
-    R3_STOP_BUTTON  = (SIDE_X + 136, SIDE_Y + 344, SIDE_X + 246, SIDE_Y + 382)
-    R3_CLEAR_BUTTON = (SIDE_X + 254, SIDE_Y + 344, SIDE_X + 372, SIDE_Y + 382)
+    R3_START_BUTTON = (SIDE_X + 18, SIDE_Y + 370, SIDE_X + 128, SIDE_Y + 408)
+    R3_STOP_BUTTON  = (SIDE_X + 136, SIDE_Y + 370, SIDE_X + 246, SIDE_Y + 408)
+    R3_CLEAR_BUTTON = (SIDE_X + 254, SIDE_Y + 370, SIDE_X + 372, SIDE_Y + 408)
 
-    # ============================================================
+    R29_START_BUTTON = (SIDE_X + 18, SIDE_Y + 416, SIDE_X + 128, SIDE_Y + 454)
+    R29_STOP_BUTTON  = (SIDE_X + 136, SIDE_Y + 416, SIDE_X + 246, SIDE_Y + 454)
+    R29_CLEAR_BUTTON = (SIDE_X + 254, SIDE_Y + 416, SIDE_X + 372, SIDE_Y + 454)
+
     # WAYPOINT CONTROL
-    # ============================================================
-    # Chọn robot cần gán điểm đích.
-    TARGET_R8_BUTTON = (SIDE_X + 18, SIDE_Y + 632, SIDE_X + 128, SIDE_Y + 668)
-    TARGET_R7_BUTTON = (SIDE_X + 136, SIDE_Y + 632, SIDE_X + 246, SIDE_Y + 668)
-    TARGET_R3_BUTTON = (SIDE_X + 254, SIDE_Y + 632, SIDE_X + 372, SIDE_Y + 668)
+    TARGET_R8_BUTTON  = (SIDE_X + 18,  SIDE_Y + 740, SIDE_X + 100, SIDE_Y + 776)
+    TARGET_R7_BUTTON  = (SIDE_X + 106, SIDE_Y + 740, SIDE_X + 188, SIDE_Y + 776)
+    TARGET_R3_BUTTON  = (SIDE_X + 194, SIDE_Y + 740, SIDE_X + 276, SIDE_Y + 776)
+    TARGET_R29_BUTTON = (SIDE_X + 282, SIDE_Y + 740, SIDE_X + 372, SIDE_Y + 776)
 
-    # Gửi / hoàn tác / xóa danh sách điểm của robot đang chọn.
-    TARGET_SEND_BUTTON  = (SIDE_X + 18, SIDE_Y + 678, SIDE_X + 128, SIDE_Y + 714)
-    TARGET_UNDO_BUTTON  = (SIDE_X + 136, SIDE_Y + 678, SIDE_X + 246, SIDE_Y + 714)
-    TARGET_CLEAR_BUTTON = (SIDE_X + 254, SIDE_Y + 678, SIDE_X + 372, SIDE_Y + 714)
+    TARGET_SEND_BUTTON  = (SIDE_X + 18, SIDE_Y + 786, SIDE_X + 128, SIDE_Y + 822)
+    TARGET_UNDO_BUTTON  = (SIDE_X + 136, SIDE_Y + 786, SIDE_X + 246, SIDE_Y + 822)
+    TARGET_CLEAR_BUTTON = (SIDE_X + 254, SIDE_Y + 786, SIDE_X + 372, SIDE_Y + 822)
 
-    # Camera preview mở thành cửa sổ riêng, chỉ khi cần xem.
-    CAM1_VIEW_BUTTON = (SIDE_X + 18, SIDE_Y + 760, SIDE_X + 190, SIDE_Y + 796)
-    CAM2_VIEW_BUTTON = (SIDE_X + 200, SIDE_Y + 760, SIDE_X + 372, SIDE_Y + 796)
+    CAM1_VIEW_BUTTON = (SIDE_X + 18, SIDE_Y + 875, SIDE_X + 190, SIDE_Y + 911)
+    CAM2_VIEW_BUTTON = (SIDE_X + 200, SIDE_Y + 875, SIDE_X + 372, SIDE_Y + 911)
     CAM1_WINDOW = 'Camera 1 Preview'
     CAM2_WINDOW = 'Camera 2 Preview'
 
@@ -775,7 +783,6 @@ def handle_camera():
     SLIDER_RIGHT = MAP_X + MAP_VIEW_WIDTH - 20
     SLIDER_Y = MAP_Y + MAP_VIEW_HEIGHT + 18
 
-    # ===============================================================
     # MAP ZOOM / PAN
     #
     # zoom = 1.0  -> đúng kích thước cũ
@@ -784,7 +791,6 @@ def handle_camera():
     #
     # MAP_MIN_ZOOM được chọn để khi thu nhỏ tối đa có thể nhìn gần như
     # toàn bộ chiều ngang canvas bản đồ.
-    # ===============================================================
     MAP_MIN_ZOOM = max(0.45, MAP_VIEW_WIDTH / float(MAP_CANVAS_WIDTH))
     MAP_MAX_ZOOM = 2.50
     MAP_ZOOM_STEP = 1.15
@@ -819,6 +825,7 @@ def handle_camera():
         robot_id: [],
         robot2_id: [],
         robot3_id: [],
+        robot4_id: [],
     }
 
     MAX_WAYPOINTS_PER_ROBOT = 50
@@ -1017,13 +1024,13 @@ def handle_camera():
                 ui_state['action'] = 'clear_r8'
                 return
             if _inside(R7_START_BUTTON, mouse_x, mouse_y):
-                ui_state['action'] = 'start_r9'
+                ui_state['action'] = 'start_r7'
                 return
             if _inside(R7_STOP_BUTTON, mouse_x, mouse_y):
-                ui_state['action'] = 'stop_r9'
+                ui_state['action'] = 'stop_r7'
                 return
             if _inside(R7_CLEAR_BUTTON, mouse_x, mouse_y):
-                ui_state['action'] = 'clear_r9'
+                ui_state['action'] = 'clear_r7'
                 return
             if _inside(R3_START_BUTTON, mouse_x, mouse_y):
                 ui_state['action'] = 'start_r3'
@@ -1034,10 +1041,17 @@ def handle_camera():
             if _inside(R3_CLEAR_BUTTON, mouse_x, mouse_y):
                 ui_state['action'] = 'clear_r3'
                 return
+            if _inside(R29_START_BUTTON, mouse_x, mouse_y):
+                ui_state['action'] = 'start_r29'
+                return
+            if _inside(R29_STOP_BUTTON, mouse_x, mouse_y):
+                ui_state['action'] = 'stop_r29'
+                return
+            if _inside(R29_CLEAR_BUTTON, mouse_x, mouse_y):
+                ui_state['action'] = 'clear_r29'
+                return
 
-            # ========================================================
             # CHỌN ROBOT ĐỂ CHẤM WAYPOINT
-            # ========================================================
             if _inside(TARGET_R8_BUTTON, mouse_x, mouse_y):
                 ui_state['target_robot'] = robot_id
                 return
@@ -1048,6 +1062,10 @@ def handle_camera():
 
             if _inside(TARGET_R3_BUTTON, mouse_x, mouse_y):
                 ui_state['target_robot'] = robot3_id
+                return
+
+            if _inside(TARGET_R29_BUTTON, mouse_x, mouse_y):
+                ui_state['target_robot'] = robot4_id
                 return
 
             if _inside(TARGET_SEND_BUTTON, mouse_x, mouse_y):
@@ -1201,8 +1219,9 @@ def handle_camera():
     _add_event('Dashboard ready', CYAN)
     last_logged_connected = None
     last_logged_send8_enabled = None
-    last_logged_send9_enabled = None
+    last_logged_send7_enabled = None
     last_logged_send3_enabled = None
+    last_logged_send29_enabled = None
     last_logged_source = None
     last_logged_robot_visible = None
 
@@ -1245,9 +1264,7 @@ def handle_camera():
                 cv2.FONT_HERSHEY_DUPLEX, 0.65, AXIS_COLOR, 1, cv2.LINE_AA)
 
 
-    # ===============================================================
     # PATH CACHE - GIỮ TOÀN BỘ ĐƯỜNG ĐI
-    # ===============================================================
     # Không giới hạn 140/500 điểm nữa.
     # Mỗi đoạn quỹ đạo chỉ được vẽ MỘT LẦN vào map_with_paths.
     # Vì vậy robot có thể vẽ chữ/quỹ đạo rất dài mà FPS không giảm dần
@@ -1256,6 +1273,7 @@ def handle_camera():
         robot_id: (60, 130, 220),
         robot2_id: (220, 150, 35),
         robot3_id: (160, 70, 210),
+        robot4_id: (80, 180, 180),
     }
 
     map_with_paths = base_map.copy()
@@ -1297,11 +1315,10 @@ def handle_camera():
         _draw_complete_path(rebuilt, robot_path, PATH_COLORS[robot_id])
         _draw_complete_path(rebuilt, robot2_path, PATH_COLORS[robot2_id])
         _draw_complete_path(rebuilt, robot3_path, PATH_COLORS[robot3_id])
+        _draw_complete_path(rebuilt, robot4_path, PATH_COLORS[robot4_id])
         return rebuilt
 
-    # ===============================================================
     # UI / PERFORMANCE
-    # ===============================================================
     # Dashboard vẫn khá mượt; tracking ArUco không bị giới hạn bởi con số này.
     UI_RENDER_INTERVAL = 1.0 / 18.0
 
@@ -1318,16 +1335,20 @@ def handle_camera():
         max_workers=2,
         thread_name_prefix='aruco'
     )
-    # ==============================================================================
 
     while True:
-        # Lấy ảnh tức thời từ trạm bơm (mất 0.0001 giây thay vì 20 mili-giây)
         success, img = cam_stream.read()
         success2, img2 = cam_stream2.read()
         # success2 = True
         # img2 = np.zeros((10, 10, 3), dtype=np.uint8)
-        #  2 dòng bảo vệ này để chặn khung hình bị lỗi
-        if not success or not success2 or img is None or img.shape[0] == 0:
+        if (
+            not success
+            or not success2
+            or img is None
+            or img2 is None
+            or img.size == 0
+            or img2.size == 0
+        ):
             continue
 
         # img2 = cv2.resize(img2, None, fx=0.5625, fy=0.5625)
@@ -1341,7 +1362,6 @@ def handle_camera():
         BG_W = MAP_CANVAS_WIDTH
         BG_H = MAP_CANVAS_HEIGHT
 
-        # Luoi, truc va nhan da duoc ve san trong base_map.
         background = map_with_paths.copy()
 
         # Mỗi camera tạo một ứng viên độc lập. Chỉ sau đó mới chọn một nguồn duy nhất.
@@ -1365,12 +1385,15 @@ def handle_camera():
         robot3_angle_cam1 = None
         robot3_angle_cam2 = None
 
+        robot4_candidate_cam1 = None
+        robot4_candidate_cam2 = None
+        robot4_angle_cam1 = None
+        robot4_angle_cam2 = None
+
         angles_cam1 = {}
         angles_cam2 = {}
         if success and success2:
             num_frames += 1
-            # Kỹ thuật Frame Skipping CÓ BỘ NHỚ
-            # Kỹ thuật Frame Skipping CÓ BỘ NHỚ CHO CẢ 2 CAM
             frame_counter += 1
             if frame_counter % ARUCO_DETECT_INTERVAL == 0:
                 imgGray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
@@ -1393,7 +1416,6 @@ def handle_camera():
                 corners, ids, rejected = future_cam1.result()
                 corners2, ids2, rejected2 = future_cam2.result()
 
-                # Lưu lại kết quả vào bộ nhớ
                 last_corners = corners
                 last_ids = ids
                 last_corners2 = corners2
@@ -1405,9 +1427,7 @@ def handle_camera():
                 corners2 = last_corners2
                 ids2 = last_ids2
 
-            # =================================================================
             # XỬ LÝ ẢNH CAM 1
-            # =================================================================
             if len(corners) > 0:
                 ids = ids.flatten()
                 for idx in ids:
@@ -1417,21 +1437,21 @@ def handle_camera():
                 for (markerCorner, markerID) in zip(corners, ids):
 
                     c_pts = markerCorner.reshape((4, 2))
-                    (topLeft, topRight, bottomRight, bottomLeft) = c_pts
+                    center = get_marker_center(markerCorner)
+                    if center is None:
+                        continue
+                    cX, cY = center
+                    center_draw = (int(round(cX)), int(round(cY)))
 
-                    topRight = (int(topRight[0]), int(topRight[1]))
-                    bottomRight = (int(bottomRight[0]), int(bottomRight[1]))
-                    bottomLeft = (int(bottomLeft[0]), int(bottomLeft[1]))
-                    topLeft = (int(topLeft[0]), int(topLeft[1]))
+                    topLeft, topRight, bottomRight, bottomLeft = [
+                        tuple(np.rint(p).astype(int)) for p in c_pts
+                    ]
 
                     if ui_state['camera_view'] == 'cam1':
                         cv2.line(img, topLeft, topRight, (0, 255, 0), 2)
                         cv2.line(img, topRight, bottomRight, (0, 255, 0), 2)
                         cv2.line(img, bottomRight, bottomLeft, (0, 255, 0), 2)
                         cv2.line(img, bottomLeft, topLeft, (0, 255, 0), 2)
-
-                    cX = int((topLeft[0] + bottomRight[0]) / 2.0)
-                    cY = int((topLeft[1] + bottomRight[1]) / 2.0)
                     marker_angle_cam1 = get_marker_world_angle(
                         markerCorner,
                         matrix_cam1_to_real
@@ -1460,12 +1480,15 @@ def handle_camera():
                         elif marker_id_int == robot3_id:
                             robot3_candidate_cam1 = robot_now_cam1
                             robot3_angle_cam1 = marker_angle_cam1
+                        elif marker_id_int == robot4_id:
+                            robot4_candidate_cam1 = robot_now_cam1
+                            robot4_angle_cam1 = marker_angle_cam1
 
                         if marker_angle_cam1 is not None:
                             cv2.putText(
                                 img,
                                 f"R{marker_id_int} A={marker_angle_cam1:.1f} deg",
-                                (cX + 10, cY + 25),
+                                (center_draw[0] + 10, center_draw[1] + 25),
                                 cv2.FONT_HERSHEY_SIMPLEX,
                                 0.55,
                                 (255, 0, 255),
@@ -1482,12 +1505,9 @@ def handle_camera():
 
                     if ui_state['camera_view'] == 'cam1':
                         cv2.circle(img, topLeft, 2, (0, 0, 255), -1)
-                        cv2.circle(img, (cX, cY), 2, (0, 255, 255), -1)
+                        cv2.circle(img, center_draw, 2, (0, 255, 255), -1)
 
-            # =================================================================
             # 1. CẬP NHẬT TỌA ĐỘ CAM 1
-            # Chỉ dùng ID đang được nhìn thấy ở nhịp hiện tại; không dùng vị trí lưu cũ.
-            # =================================================================
             current_ids_cam1 = set(ids.tolist()) if ids is not None else set()
             for key in current_ids_cam1:
                 if key not in positions_map or len(positions_map[key]) == 0:
@@ -1504,12 +1524,12 @@ def handle_camera():
                     robot2_candidate_cam1 = real_point
                 elif key == robot3_id:
                     robot3_candidate_cam1 = real_point
+                elif key == robot4_id:
+                    robot4_candidate_cam1 = real_point
                 else:
                     real_map1[key] = real_point
 
-            # =================================================================
             # 2. XỬ LÝ ẢNH VÀ TỌA ĐỘ CAM 2
-            # =================================================================
             if len(corners2) > 0:
                 ids2 = ids2.flatten()
                 for idx in ids2:
@@ -1519,21 +1539,21 @@ def handle_camera():
                 for (markerCorner, markerID) in zip(corners2, ids2):
 
                     c_pts2 = markerCorner.reshape((4, 2))
-                    (topLeft2, topRight2, bottomRight2, bottomLeft2) = c_pts2
+                    center2 = get_marker_center(markerCorner)
+                    if center2 is None:
+                        continue
+                    cX, cY = center2
+                    center_draw2 = (int(round(cX)), int(round(cY)))
 
-                    topRight2 = (int(topRight2[0]), int(topRight2[1]))
-                    bottomRight2 = (int(bottomRight2[0]), int(bottomRight2[1]))
-                    bottomLeft2 = (int(bottomLeft2[0]), int(bottomLeft2[1]))
-                    topLeft2 = (int(topLeft2[0]), int(topLeft2[1]))
+                    topLeft2, topRight2, bottomRight2, bottomLeft2 = [
+                        tuple(np.rint(p).astype(int)) for p in c_pts2
+                    ]
 
                     if ui_state['camera_view'] == 'cam2':
                         cv2.line(img2, topLeft2, topRight2, (0, 255, 0), 2)
                         cv2.line(img2, topRight2, bottomRight2, (0, 255, 0), 2)
                         cv2.line(img2, bottomRight2, bottomLeft2, (0, 255, 0), 2)
                         cv2.line(img2, bottomLeft2, topLeft2, (0, 255, 0), 2)
-
-                    cX = int((topLeft2[0] + bottomRight2[0]) / 2.0)
-                    cY = int((topLeft2[1] + bottomRight2[1]) / 2.0)
                     marker_angle_cam2 = None
 
                     if matrix_cam2_to_real is not None:
@@ -1548,7 +1568,6 @@ def handle_camera():
                     marker_id_int = int(markerID)
 
                     if marker_id_int in ROBOT_IDS:
-                        # Robot luôn lấy tâm mới nhất ở Camera 2.
                         positions_map2[marker_id_int] = [(cX, cY)]
 
                         robot_now_cam2 = None
@@ -1567,12 +1586,15 @@ def handle_camera():
                         elif marker_id_int == robot3_id:
                             robot3_candidate_cam2 = robot_now_cam2
                             robot3_angle_cam2 = marker_angle_cam2
+                        elif marker_id_int == robot4_id:
+                            robot4_candidate_cam2 = robot_now_cam2
+                            robot4_angle_cam2 = marker_angle_cam2
 
                         if marker_angle_cam2 is not None:
                             cv2.putText(
                                 img2,
                                 f"R{marker_id_int} A={marker_angle_cam2:.1f} deg",
-                                (cX + 10, cY + 25),
+                                (center_draw2[0] + 10, center_draw2[1] + 25),
                                 cv2.FONT_HERSHEY_SIMPLEX,
                                 0.55,
                                 (255, 0, 255),
@@ -1589,7 +1611,7 @@ def handle_camera():
 
                     if ui_state['camera_view'] == 'cam2':
                         cv2.circle(img2, topLeft2, 2, (0, 0, 255), -1)
-                        cv2.circle(img2, (cX, cY), 2, (0, 255, 255), -1)
+                        cv2.circle(img2, center_draw2, 2, (0, 255, 255), -1)
 
             current_ids_cam2 = set(ids2.tolist()) if ids2 is not None else set()
             if matrix_cam2_to_real is not None:
@@ -1610,6 +1632,8 @@ def handle_camera():
                         robot2_candidate_cam2 = real_pt
                     elif key == robot3_id:
                         robot3_candidate_cam2 = real_pt
+                    elif key == robot4_id:
+                        robot4_candidate_cam2 = real_pt
                     elif key not in current_ids_cam1:
                         # Chỉ các marker thường mới dùng quy tắc ưu tiên Cam1 trực tiếp.
                         real_map1[key] = real_pt
@@ -1636,17 +1660,13 @@ def handle_camera():
                         and marker_id in angles_cam2
                 ):
                     real_angle_map[marker_id] = angles_cam2[marker_id]
-            # =================================================================
             # 2B. HỢP NHẤT ROBOT TRONG VÙNG CHỒNG LẤN
-            # =================================================================
             candidates = {
                 'cam1': robot_candidate_cam1,
                 'cam2': robot_candidate_cam2,
             }
 
-            # -------------------------------------------------------------
             # THEO DÕI MẤT / XUẤT HIỆN LẠI robot
-            # -------------------------------------------------------------
             robot_seen_now = (
                     robot_candidate_cam1 is not None
                     or robot_candidate_cam2 is not None
@@ -1712,9 +1732,7 @@ def handle_camera():
                             if robot_path[-1] is not None:
                                 robot_path.append(None)
 
-            # -------------------------------------------------------------
             # CHỌN CAMERA VÀ BÀN GIAO LIỀN MẠCH
-            # -------------------------------------------------------------
             if robot_active_camera is None:
                 if robot_candidate_cam1 is not None:
                     robot_active_camera = 'cam1'
@@ -1813,9 +1831,7 @@ def handle_camera():
                         selected_position = corrected_candidate(other_source)
                         robot_active_missing_frames = 0
 
-            # ============================================================
             # 6. CHỌN GÓC THEO CAMERA ĐANG ĐƯỢC SỬ DỤNG
-            # ============================================================
 
             selected_angle = None
             if selected_position is not None:
@@ -1824,9 +1840,7 @@ def handle_camera():
                 elif selected_source == 'cam2':
                     selected_angle = robot_angle_cam2
 
-            # ============================================================
             # 7. LỌC MƯỢT GÓC ROBOT
-            # ============================================================
 
             if selected_angle is not None:
                 robot_filtered_angle = smooth_angle_deg(
@@ -1836,9 +1850,7 @@ def handle_camera():
                 )
             if robot_filtered_angle is not None:
                 real_angle_map[robot_id] = robot_filtered_angle
-            # ============================================================
             # TIẾP TỤC XỬ LÝ VỊ TRÍ NHƯ CODE CŨ
-            # ============================================================
 
             if selected_position is not None:
 
@@ -1879,9 +1891,7 @@ def handle_camera():
             else:
                 real_map1.pop(robot_id, None)
 
-            # =================================================================
             # 2C. HỢP NHẤT ROBOT 2 (ID 7) TRONG VÙNG CHỒNG LẤN
-            # =================================================================
             # QUAN TRỌNG:
             # Không còn lấy robot2_raw_position = real_map1[robot2_id].
             # Robot 2 có 2 candidate độc lập và một active_camera riêng.
@@ -1902,9 +1912,7 @@ def handle_camera():
             )
             robot2_reacquired = False
 
-            # -------------------------------------------------------------
             # MẤT / XUẤT HIỆN LẠI ROBOT 2
-            # -------------------------------------------------------------
             if not robot2_seen_now:
                 robot2_lost_frames += 1
 
@@ -1945,9 +1953,7 @@ def handle_camera():
                     robot2_source_label = robot2_active_camera.upper()
                     robot2_reacquired = True
 
-            # -------------------------------------------------------------
             # KHÓA CAMERA VÀ HANDOFF ROBOT 2
-            # -------------------------------------------------------------
             if robot2_active_camera is None:
                 if robot2_candidate_cam1 is not None:
                     robot2_active_camera = 'cam1'
@@ -2020,9 +2026,7 @@ def handle_camera():
             else:
                 robot2_selected_position = None
 
-            # -------------------------------------------------------------
             # CHẶN JUMP BẤT THƯỜNG
-            # -------------------------------------------------------------
             if (
                 robot2_selected_position is not None
                 and robot2_filtered_position is not None
@@ -2058,9 +2062,7 @@ def handle_camera():
                         )
                         robot2_active_missing_frames = 0
 
-            # -------------------------------------------------------------
             # GÓC: PHẢI ĐI CÙNG CAMERA ĐANG CUNG CẤP TỌA ĐỘ
-            # -------------------------------------------------------------
             robot2_selected_angle = None
             if robot2_selected_position is not None:
                 robot2_selected_angle = robot2_angles.get(
@@ -2074,9 +2076,7 @@ def handle_camera():
                     alpha=0.35
                 )
 
-            # -------------------------------------------------------------
             # EMA VỊ TRÍ ROBOT 2
-            # -------------------------------------------------------------
             if robot2_selected_position is not None:
                 if robot2_filtered_position is None:
                     robot2_filtered_position = (
@@ -2111,11 +2111,10 @@ def handle_camera():
                 real_angle_map.pop(robot2_id, None)
 
             # 2C. HỢP NHẤT ROBOT 3 (ID 3) TRONG VÙNG CHỒNG LẤN
-            # =================================================================
             # QUAN TRỌNG:
             # Không còn lấy robot3_raw_position = real_map1[robot3_id].
             # Robot 3 có 2 candidate độc lập và một active_camera riêng.
-            # Khi Cam1 + Cam2 cùng thấy ID10, camera đang active được khóa lại,
+            # Khi Cam1 + Cam2 cùng thấy ID29, camera đang active được khóa lại,
             # nên tọa độ không nhảy qua lại giữa H1 và H2 theo từng frame.
             robot3_candidates = {
                 'cam1': robot3_candidate_cam1,
@@ -2132,9 +2131,7 @@ def handle_camera():
             )
             robot3_reacquired = False
 
-            # -------------------------------------------------------------
             # MẤT / XUẤT HIỆN LẠI ROBOT 3
-            # -------------------------------------------------------------
             if not robot3_seen_now:
                 robot3_lost_frames += 1
 
@@ -2175,9 +2172,7 @@ def handle_camera():
                     robot3_source_label = robot3_active_camera.upper()
                     robot3_reacquired = True
 
-            # -------------------------------------------------------------
             # KHÓA CAMERA VÀ HANDOFF ROBOT 3
-            # -------------------------------------------------------------
             if robot3_active_camera is None:
                 if robot3_candidate_cam1 is not None:
                     robot3_active_camera = 'cam1'
@@ -2216,7 +2211,7 @@ def handle_camera():
                 robot3_active_missing_frames = 0
 
             elif robot3_selected_source is not None:
-                # Chỉ khi camera active mất ID10 mới bắt đầu đếm để chuyển nguồn.
+                # Chỉ khi camera active mất ID29 mới bắt đầu đếm để chuyển nguồn.
                 robot3_active_missing_frames += 1
                 robot3_other_source = (
                     'cam2' if robot3_selected_source == 'cam1' else 'cam1'
@@ -2250,9 +2245,7 @@ def handle_camera():
             else:
                 robot3_selected_position = None
 
-            # -------------------------------------------------------------
             # CHẶN JUMP BẤT THƯỜNG
-            # -------------------------------------------------------------
             if (
                 robot3_selected_position is not None
                 and robot3_filtered_position is not None
@@ -2288,9 +2281,7 @@ def handle_camera():
                         )
                         robot3_active_missing_frames = 0
 
-            # -------------------------------------------------------------
             # GÓC: PHẢI ĐI CÙNG CAMERA ĐANG CUNG CẤP TỌA ĐỘ
-            # -------------------------------------------------------------
             robot3_selected_angle = None
             if robot3_selected_position is not None:
                 robot3_selected_angle = robot3_angles.get(
@@ -2304,9 +2295,7 @@ def handle_camera():
                     alpha=0.35
                 )
 
-            # -------------------------------------------------------------
             # EMA VỊ TRÍ ROBOT 3
-            # -------------------------------------------------------------
             if robot3_selected_position is not None:
                 if robot3_filtered_position is None:
                     robot3_filtered_position = (
@@ -2340,18 +2329,233 @@ def handle_camera():
                 real_map1.pop(robot3_id, None)
                 real_angle_map.pop(robot3_id, None)
 
-            # =================================================================
-            # 3. GỬI 3 ROBOT QUA SERIAL -> ESP32
-            # =================================================================
+            # 2D. HỢP NHẤT ROBOT 4 (ID 29) TRONG VÙNG CHỒNG LẤN
+            # QUAN TRỌNG:
+            # Không còn lấy robot4_raw_position = real_map1[robot4_id].
+            # Robot 4 có 2 candidate độc lập và một active_camera riêng.
+            # Khi Cam1 + Cam2 cùng thấy ID29, camera đang active được khóa lại,
+            # nên tọa độ không nhảy qua lại giữa H1 và H2 theo từng frame.
+            robot4_candidates = {
+                'cam1': robot4_candidate_cam1,
+                'cam2': robot4_candidate_cam2,
+            }
+            robot4_angles = {
+                'cam1': robot4_angle_cam1,
+                'cam2': robot4_angle_cam2,
+            }
+
+            robot4_seen_now = (
+                robot4_candidate_cam1 is not None
+                or robot4_candidate_cam2 is not None
+            )
+            robot4_reacquired = False
+
+            # MẤT / XUẤT HIỆN LẠI ROBOT 4
+            if not robot4_seen_now:
+                robot4_lost_frames += 1
+
+                if robot4_lost_frames >= ROBOT_LOST_HIDE_FRAMES:
+                    real_map1.pop(robot4_id, None)
+                    real_angle_map.pop(robot4_id, None)
+                    robot4_source_label = 'NONE'
+
+                if robot4_lost_frames >= ROBOT_LOST_RESET_FRAMES:
+                    robot4_active_camera = None
+                    robot4_active_missing_frames = 0
+                    robot4_filtered_position = None
+                    robot4_filtered_angle = None
+                    robot4_camera_offsets['cam1'] = (0.0, 0.0)
+                    robot4_camera_offsets['cam2'] = (0.0, 0.0)
+
+            else:
+                robot4_was_hidden = (
+                    robot4_lost_frames >= ROBOT_LOST_HIDE_FRAMES
+                )
+                robot4_lost_frames = 0
+
+                if robot4_was_hidden:
+                    # Ưu tiên Cam1 lúc bắt lại nếu Cam1 đang thấy; nếu không thì Cam2.
+                    if robot4_candidate_cam1 is not None:
+                        robot4_active_camera = 'cam1'
+                        robot4_first_position = robot4_candidate_cam1
+                    else:
+                        robot4_active_camera = 'cam2'
+                        robot4_first_position = robot4_candidate_cam2
+
+                    robot4_camera_offsets[robot4_active_camera] = (0.0, 0.0)
+                    robot4_filtered_position = (
+                        float(robot4_first_position[0]),
+                        float(robot4_first_position[1]),
+                    )
+                    robot4_active_missing_frames = 0
+                    robot4_source_label = robot4_active_camera.upper()
+                    robot4_reacquired = True
+
+            # KHÓA CAMERA VÀ HANDOFF ROBOT 4
+            if robot4_active_camera is None:
+                if robot4_candidate_cam1 is not None:
+                    robot4_active_camera = 'cam1'
+                elif robot4_candidate_cam2 is not None:
+                    robot4_active_camera = 'cam2'
+
+                if (
+                    robot4_active_camera is not None
+                    and robot4_filtered_position is None
+                ):
+                    robot4_camera_offsets[robot4_active_camera] = (0.0, 0.0)
+
+            def corrected_candidate_robot4(source_name):
+                raw_position = robot4_candidates.get(source_name)
+                if raw_position is None:
+                    return None
+
+                offset_x, offset_y = robot4_camera_offsets[source_name]
+                return (
+                    float(raw_position[0]) + float(offset_x),
+                    float(raw_position[1]) + float(offset_y),
+                )
+
+            robot4_selected_source = robot4_active_camera
+            robot4_selected_position = (
+                corrected_candidate_robot4(robot4_selected_source)
+                if robot4_selected_source is not None
+                else None
+            )
+
+            if (
+                robot4_selected_source is not None
+                and robot4_selected_position is not None
+            ):
+                # Camera hiện tại vẫn thấy Robot 4 -> tuyệt đối không đổi nguồn.
+                robot4_active_missing_frames = 0
+
+            elif robot4_selected_source is not None:
+                # Chỉ khi camera active mất ID29 mới bắt đầu đếm để chuyển nguồn.
+                robot4_active_missing_frames += 1
+                robot4_other_source = (
+                    'cam2' if robot4_selected_source == 'cam1' else 'cam1'
+                )
+                robot4_other_raw = robot4_candidates.get(robot4_other_source)
+
+                if (
+                    robot4_other_raw is not None
+                    and robot4_active_missing_frames >= ROBOT_SWITCH_CONFIRM_FRAMES
+                ):
+                    # Neo camera mới vào vị trí lọc cuối cùng để tránh bước nhảy
+                    # do H1 và H2 còn chênh nhau vài cm ở vùng overlap.
+                    if robot4_filtered_position is not None:
+                        robot4_camera_offsets[robot4_other_source] = (
+                            float(robot4_filtered_position[0]) - float(robot4_other_raw[0]),
+                            float(robot4_filtered_position[1]) - float(robot4_other_raw[1]),
+                        )
+                    else:
+                        robot4_camera_offsets[robot4_other_source] = (0.0, 0.0)
+
+                    robot4_active_camera = robot4_other_source
+                    robot4_selected_source = robot4_other_source
+                    robot4_selected_position = corrected_candidate_robot4(
+                        robot4_other_source
+                    )
+                    robot4_active_missing_frames = 0
+                else:
+                    # Trong thời gian xác nhận handoff: GIỮ vị trí lọc cũ,
+                    # không lấy xen kẽ dữ liệu từ camera còn lại.
+                    robot4_selected_position = None
+            else:
+                robot4_selected_position = None
+
+            # CHẶN JUMP BẤT THƯỜNG
+            if (
+                robot4_selected_position is not None
+                and robot4_filtered_position is not None
+                and not robot4_reacquired
+            ):
+                robot4_selected_jump = math.dist(
+                    robot4_selected_position,
+                    robot4_filtered_position
+                )
+
+                if robot4_selected_jump > ROBOT_MAX_JUMP_CM:
+                    # Không switch ngay vì một frame jump.
+                    robot4_selected_position = None
+                    robot4_active_missing_frames += 1
+
+                    robot4_other_source = (
+                        'cam2' if robot4_selected_source == 'cam1' else 'cam1'
+                    )
+                    robot4_other_raw = robot4_candidates.get(robot4_other_source)
+
+                    if (
+                        robot4_other_raw is not None
+                        and robot4_active_missing_frames >= ROBOT_SWITCH_CONFIRM_FRAMES
+                    ):
+                        robot4_camera_offsets[robot4_other_source] = (
+                            float(robot4_filtered_position[0]) - float(robot4_other_raw[0]),
+                            float(robot4_filtered_position[1]) - float(robot4_other_raw[1]),
+                        )
+                        robot4_active_camera = robot4_other_source
+                        robot4_selected_source = robot4_other_source
+                        robot4_selected_position = corrected_candidate_robot4(
+                            robot4_other_source
+                        )
+                        robot4_active_missing_frames = 0
+
+            # GÓC: PHẢI ĐI CÙNG CAMERA ĐANG CUNG CẤP TỌA ĐỘ
+            robot4_selected_angle = None
+            if robot4_selected_position is not None:
+                robot4_selected_angle = robot4_angles.get(
+                    robot4_selected_source
+                )
+
+            if robot4_selected_angle is not None:
+                robot4_filtered_angle = smooth_angle_deg(
+                    robot4_filtered_angle,
+                    robot4_selected_angle,
+                    alpha=0.35
+                )
+
+            # EMA VỊ TRÍ ROBOT 4
+            if robot4_selected_position is not None:
+                if robot4_filtered_position is None:
+                    robot4_filtered_position = (
+                        float(robot4_selected_position[0]),
+                        float(robot4_selected_position[1]),
+                    )
+                else:
+                    alpha4 = ROBOT_POSITION_EMA_ALPHA
+                    robot4_filtered_position = (
+                        (1.0 - alpha4) * robot4_filtered_position[0]
+                        + alpha4 * robot4_selected_position[0],
+                        (1.0 - alpha4) * robot4_filtered_position[1]
+                        + alpha4 * robot4_selected_position[1],
+                    )
+
+                robot4_source_label = robot4_selected_source.upper()
+
+            keep_robot4_visible = (
+                robot4_seen_now
+                or robot4_lost_frames < ROBOT_LOST_HIDE_FRAMES
+            )
+
+            if robot4_filtered_position is not None and keep_robot4_visible:
+                real_map1[robot4_id] = (
+                    round(float(robot4_filtered_position[0]), 1),
+                    round(float(robot4_filtered_position[1]), 1),
+                )
+                if robot4_filtered_angle is not None:
+                    real_angle_map[robot4_id] = robot4_filtered_angle
+            else:
+                real_map1.pop(robot4_id, None)
+                real_angle_map.pop(robot4_id, None)
+
+            # 3. GỬI 4 ROBOT QUA SERIAL -> ESP32
             # Giao thức Python -> ESP32 gateway:
             #   ID;X.X;Y.Y;ANGLE.A#
             # X, Y, ANGLE đều gửi dạng float với 1 chữ số thập phân.
-            # Ví dụ một nhịp có đủ 3 robot:
-            #   8;352.4;64.7;43.2#9;420.8;80.1;271.6#3;500.2;40.0;90.0#
+            # Ví dụ một nhịp có đủ 4 robot:
+            #   8;352.4;64.7;43.2#7;420.8;80.1;271.6#3;500.2;40.0;90.0#29;510.0;60.0;180.0#
             # ESP32 gateway chỉ cần tách từng packet theo dấu '#', đọc ID đầu tiên
             # rồi route packet đến đúng robot.
-            packets_to_send = []
-
             # ---------------- Robot 1 ----------------
             if robot_filtered_position is not None and keep_robot_visible:
                 x_send = round(float(robot_filtered_position[0]), 1)
@@ -2421,19 +2625,38 @@ def handle_camera():
                     latest_y3 = None
                 _set_latest_robot_packet(robot3_id, None)
 
+            # ---------------- Robot 4 ----------------
+            if robot4_filtered_position is not None and keep_robot4_visible:
+                x4_send = round(float(robot4_filtered_position[0]), 1)
+                y4_send = round(float(robot4_filtered_position[1]), 1)
+                angle4_send = (
+                    round(float(robot4_filtered_angle), 1)
+                    if robot4_filtered_angle is not None else 0.0
+                )
+
+                with latest_xy_lock:
+                    latest_x4 = x4_send
+                    latest_y4 = y4_send
+
+                _set_latest_robot_packet(
+                    robot4_id,
+                    f"{robot4_id};{x4_send:.1f};{y4_send:.1f};{angle4_send:.1f}#"
+                )
+            else:
+                with latest_xy_lock:
+                    latest_x4 = None
+                    latest_y4 = None
+                _set_latest_robot_packet(robot4_id, None)
+
             # Không gửi Serial ở luồng camera nữa.
             # send_data() sẽ tự đọc các packet mới nhất và phát ở TX_TARGET_HZ.
 
-            # =================================================================
             # 4. HỆ THỐNG RADAR TỔNG (Độc lập 100%)
-            # =================================================================
-            # Không đặt lại SCALE ở đây. Khung sân, marker và quỹ đạo phải dùng
             # đúng cùng tỷ lệ với lưới tọa độ đã vẽ phía trên.
             SCALE = MAP_SCALE
             OFFSET_X = _OFFSET_X
             OFFSET_Y = _OFFSET_Y
 
-            # Gộp danh sách các mã đang nhìn thấy trên CẢ 2 CAMERA
             current_seen_ids = []
             if ids is not None:
                 current_seen_ids.extend(ids.flatten().tolist())
@@ -2622,6 +2845,62 @@ def handle_camera():
                         cv2.LINE_AA
                     )
 
+                elif key == robot4_id:
+                    # ================= Robot 4 - quỹ đạo và metrics riêng =================
+                    last_path_point4 = next((p for p in reversed(robot4_path) if p is not None), None)
+                    if last_path_point4 is None:
+                        robot4_path.append((real_x, real_y, draw_x, draw_y))
+                        robot4_last_motion_time = time.perf_counter()
+                    else:
+                        path_step4 = math.dist((real_x, real_y), last_path_point4[0:2])
+                        if path_step4 >= ROBOT_PATH_BREAK_STEP_CM:
+                            robot4_path.append(None)
+                            robot4_path.append((real_x, real_y, draw_x, draw_y))
+                            robot4_speed_cm_s = 0.0
+                            robot4_last_motion_time = time.perf_counter()
+                        elif path_step4 >= ROBOT_PATH_MIN_STEP_CM:
+                            motion_now4 = time.perf_counter()
+                            if robot4_last_motion_time is not None:
+                                motion_dt4 = motion_now4 - robot4_last_motion_time
+                                if motion_dt4 > 1e-3:
+                                    instant_speed4 = path_step4 / motion_dt4
+                                    robot4_speed_cm_s = (
+                                        instant_speed4 if robot4_speed_cm_s <= 0.0
+                                        else 0.70 * robot4_speed_cm_s + 0.30 * instant_speed4
+                                    )
+                            robot4_last_motion_time = motion_now4
+                            robot4_total_distance_cm += path_step4
+
+                            new_path_point4 = (real_x, real_y, draw_x, draw_y)
+
+                            if robot4_path and robot4_path[-1] is not None:
+                                _append_cached_path_segment(
+                                    robot4_id,
+                                    robot4_path[-1],
+                                    new_path_point4
+                                )
+
+                            robot4_path.append(new_path_point4)
+
+                    # Không cắt ngắn quỹ đạo R29.
+
+                    robot4_color = (80, 180, 180)
+                    cv2.circle(background, (draw_x, draw_y), 7, robot4_color, -1, cv2.LINE_AA)
+                    robot4_angle_text = (
+                        f" A={real_angle_map[robot4_id]:.1f}"
+                        if robot4_id in real_angle_map else ''
+                    )
+                    cv2.putText(
+                        background,
+                        f"Robot [{key}]: ({int(real_x)}, {int(real_y)}){robot4_angle_text}",
+                        (draw_x + 10, draw_y - 12),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.46,
+                        robot4_color,
+                        1,
+                        cv2.LINE_AA
+                    )
+
                 else:
                     # Các mã còn lại (bao gồm cả 0, 1, 2, 3) đều vẽ màu cam đậm như vật thể bình thường
                     cv2.circle(
@@ -2663,15 +2942,13 @@ def handle_camera():
 
             # Quỹ đạo đầy đủ đã được cache trong map_with_paths.
             # Không vẽ lại toàn bộ lịch sử ở mỗi frame.
-            # ===============================================================
 
-        # ============================================================
-        # VẼ WAYPOINT CỦA 3 ROBOT
-        # ============================================================
+        # VẼ WAYPOINT CỦA 4 ROBOT
         waypoint_colors = {
             robot_id: (60, 130, 220),
             robot2_id: (220, 150, 35),
             robot3_id: (160, 70, 210),
+            robot4_id: (80, 180, 180),
         }
 
         for target_rid, points in target_waypoints.items():
@@ -2728,8 +3005,6 @@ def handle_camera():
                     cv2.LINE_AA
                 )
 
-        # =======================================================
-        # =================================================================
         elapsed = time.time() - start
         if elapsed > 1.0:
             fps_now = num_frames / elapsed
@@ -2743,9 +3018,7 @@ def handle_camera():
         if now_ui - last_ui_render >= UI_RENDER_INTERVAL:
             last_ui_render = now_ui
 
-            # =======================================================
             # CẮT + SCALE BẢN ĐỒ THEO ZOOM
-            # =======================================================
             _clamp_map_center()
 
             zoom_value = float(ui_state['zoom'])
@@ -2814,7 +3087,7 @@ def handle_camera():
             # ================= HEADER =================
             cv2.rectangle(dashboard, (0, 0), (DASHBOARD_WIDTH, HEADER_H), HEADER_BG, -1)
             cv2.rectangle(dashboard, (0, HEADER_H - 4), (DASHBOARD_WIDTH, HEADER_H), BLUE, -1)
-            cv2.putText(dashboard, '3 ROBOT TRACKING', (24, 37),
+            cv2.putText(dashboard, '4 ROBOT TRACKING', (24, 37),
                         cv2.FONT_HERSHEY_DUPLEX, 0.93, TEXT_MAIN, 1, cv2.LINE_AA)
             cv2.putText(dashboard, 'SMART CONTROL DASHBOARD', (24, 67),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.50, TEXT_MUTED, 1, cv2.LINE_AA)
@@ -2848,6 +3121,8 @@ def handle_camera():
                 ui_y2 = latest_y2
                 ui_x3 = latest_x3
                 ui_y3 = latest_y3
+                ui_x4 = latest_x4
+                ui_y4 = latest_y4
 
             robot_visible = (
                 ui_x is not None and ui_y is not None
@@ -2861,14 +3136,20 @@ def handle_camera():
                 ui_x3 is not None and ui_y3 is not None
                 and robot3_source_label != 'NONE'
             )
+            robot4_visible = (
+                ui_x4 is not None and ui_y4 is not None
+                and robot4_source_label != 'NONE'
+            )
             robot_state_text = 'VISIBLE' if robot_visible else 'SEARCHING'
             robot_state_color = GREEN if robot_visible else ORANGE
             robot2_state_text = 'VISIBLE' if robot2_visible else 'SEARCHING'
             robot2_state_color = GREEN if robot2_visible else ORANGE
             robot3_state_text = 'VISIBLE' if robot3_visible else 'SEARCHING'
             robot3_state_color = GREEN if robot3_visible else ORANGE
-            # Overlay trạng thái 3 robot trên map.
-            map_status_rect = (MAP_X + 14, MAP_Y + 14, MAP_X + 285, MAP_Y + 108)
+            robot4_state_text = 'VISIBLE' if robot4_visible else 'SEARCHING'
+            robot4_state_color = GREEN if robot4_visible else ORANGE
+            # Overlay trạng thái 4 robot trên map.
+            map_status_rect = (MAP_X + 14, MAP_Y + 14, MAP_X + 285, MAP_Y + 135)
             _draw_round_rect(dashboard, map_status_rect, HEADER_BG, 11, border=CARD_EDGE)
 
             _draw_status_dot(dashboard, (MAP_X + 33, MAP_Y + 33), robot_state_color)
@@ -2895,6 +3176,14 @@ def handle_camera():
                 cv2.FONT_HERSHEY_DUPLEX, 0.36, TEXT_MAIN, 1, cv2.LINE_AA
             )
 
+            _draw_status_dot(dashboard, (MAP_X + 33, MAP_Y + 114), robot4_state_color)
+            cv2.putText(
+                dashboard,
+                f'R{robot4_id} {robot4_state_text} {robot4_source_label}',
+                (MAP_X + 49, MAP_Y + 119),
+                cv2.FONT_HERSHEY_DUPLEX, 0.36, TEXT_MAIN, 1, cv2.LINE_AA
+            )
+
             # Chú giải nhỏ trên map.
             legend_rect = (MAP_X + MAP_VIEW_WIDTH - 250, MAP_Y + 14,
                            MAP_X + MAP_VIEW_WIDTH - 14, MAP_Y + 82)
@@ -2914,25 +3203,19 @@ def handle_camera():
                         cv2.FONT_HERSHEY_SIMPLEX, 0.37, TEXT_MUTED, 1, cv2.LINE_AA)
 
             # ================= SIDE PANEL =================
-            side_bottom = MAP_Y + MAP_VIEW_HEIGHT + SLIDER_H
+            side_bottom = max(
+                MAP_Y + MAP_VIEW_HEIGHT + SLIDER_H,
+                CAM1_VIEW_BUTTON[3] + UI_PAD
+            )
             _draw_round_rect(dashboard,
                              (SIDE_X, SIDE_Y, SIDE_X + SIDE_PANEL_WIDTH, side_bottom),
                              PANEL_BG, 18, border=CARD_EDGE)
 
             connected = ser is not None and getattr(ser, 'is_open', False)
             r8_send_on = send_robot8_enabled.is_set()
-            r9_send_on = send_robot9_enabled.is_set()
+            r7_send_on = send_robot7_enabled.is_set()
             r3_send_on = send_robot3_enabled.is_set()
-            if r8_send_on or r9_send_on or r3_send_on:
-                send_text = (
-                    f'R8:{"ON" if r8_send_on else "OFF"}  '
-                    f'R7:{"ON" if r9_send_on else "OFF"}  '
-                    f'R3:{"ON" if r3_send_on else "OFF"}'
-                )
-                send_color = GREEN if connected else ORANGE
-            else:
-                send_text = 'R8:OFF  R7:OFF  R3:OFF'
-                send_color = TEXT_MUTED
+            r29_send_on = send_robot29_enabled.is_set()
             conn_text = f'CONNECTED  {com_port}' if connected else 'DISCONNECTED'
             conn_color = GREEN if connected else RED
 
@@ -2949,13 +3232,13 @@ def handle_camera():
                 )
                 last_logged_send8_enabled = send8_state_now
 
-            send9_state_now = send_robot9_enabled.is_set()
-            if last_logged_send9_enabled is None or send9_state_now != last_logged_send9_enabled:
+            send7_state_now = send_robot7_enabled.is_set()
+            if last_logged_send7_enabled is None or send7_state_now != last_logged_send7_enabled:
                 _add_event(
-                    f'R{robot2_id} send ' + ('started' if send9_state_now else 'stopped'),
-                    GREEN if send9_state_now else TEXT_MUTED
+                    f'R{robot2_id} send ' + ('started' if send7_state_now else 'stopped'),
+                    GREEN if send7_state_now else TEXT_MUTED
                 )
-                last_logged_send9_enabled = send9_state_now
+                last_logged_send7_enabled = send7_state_now
 
             send3_state_now = send_robot3_enabled.is_set()
             if last_logged_send3_enabled is None or send3_state_now != last_logged_send3_enabled:
@@ -2964,6 +3247,14 @@ def handle_camera():
                     GREEN if send3_state_now else TEXT_MUTED
                 )
                 last_logged_send3_enabled = send3_state_now
+
+            send29_state_now = send_robot29_enabled.is_set()
+            if last_logged_send29_enabled is None or send29_state_now != last_logged_send29_enabled:
+                _add_event(
+                    f'R{robot4_id} send ' + ('started' if send29_state_now else 'stopped'),
+                    GREEN if send29_state_now else TEXT_MUTED
+                )
+                last_logged_send29_enabled = send29_state_now
             if last_logged_source is None or robot_source_label != last_logged_source:
                 if robot_source_label != 'NONE':
                     _add_event(f'Source -> {robot_source_label}', CYAN)
@@ -2973,9 +3264,7 @@ def handle_camera():
                            GREEN if robot_visible else ORANGE)
                 last_logged_robot_visible = robot_visible
 
-            # ============================================================
-            # SIDE PANEL - 3 ROBOT
-            # ============================================================
+            # SIDE PANEL - 4 ROBOT
 
             # ---------- SYSTEM STATUS ----------
             status_rect = (SIDE_X + 14, SIDE_Y + 14, SIDE_X + 376, SIDE_Y + 126)
@@ -2995,12 +3284,13 @@ def handle_camera():
                         cv2.FONT_HERSHEY_SIMPLEX, 0.36, TEXT_SOFT, 1, cv2.LINE_AA)
             send_status = (
                 f'R8:{"ON" if r8_send_on else "OFF"}   '
-                f'R7:{"ON" if r9_send_on else "OFF"}   '
-                f'R3:{"ON" if r3_send_on else "OFF"}'
+                f'R7:{"ON" if r7_send_on else "OFF"}   '
+                f'R3:{"ON" if r3_send_on else "OFF"}   '
+                f'R29:{"ON" if r29_send_on else "OFF"}'
             )
             _put_fit_text(dashboard, send_status, (SIDE_X + 82, SIDE_Y + 92), 270,
                           cv2.FONT_HERSHEY_SIMPLEX, 0.35,
-                          GREEN if (r8_send_on or r9_send_on or r3_send_on) else TEXT_MUTED, 1)
+                          GREEN if (r8_send_on or r7_send_on or r3_send_on or r29_send_on) else TEXT_MUTED, 1)
 
             cv2.putText(dashboard, 'FPS', (SIDE_X + 28, SIDE_Y + 116),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.34, TEXT_SOFT, 1, cv2.LINE_AA)
@@ -3008,7 +3298,7 @@ def handle_camera():
                         cv2.FONT_HERSHEY_DUPLEX, 0.40, CYAN, 1, cv2.LINE_AA)
 
             # ---------- ROBOTS POSITION ----------
-            pos_rect = (SIDE_X + 14, SIDE_Y + 136, SIDE_X + 376, SIDE_Y + 242)
+            pos_rect = (SIDE_X + 14, SIDE_Y + 136, SIDE_X + 376, SIDE_Y + 268)
             _draw_round_rect(dashboard, pos_rect, CARD_BG_ALT, 14, border=CARD_EDGE)
             cv2.putText(dashboard, 'ROBOTS POSITION', (SIDE_X + 28, SIDE_Y + 159),
                         cv2.FONT_HERSHEY_DUPLEX, 0.42, TEXT_MAIN, 1, cv2.LINE_AA)
@@ -3022,11 +3312,15 @@ def handle_camera():
             r3_x = '--' if ui_x3 is None else f'{ui_x3:.1f}'
             r3_y = '--' if ui_y3 is None else f'{ui_y3:.1f}'
             r3_a = '--' if robot3_filtered_angle is None else f'{robot3_filtered_angle:.1f}'
+            r4_x = '--' if ui_x4 is None else f'{ui_x4:.1f}'
+            r4_y = '--' if ui_y4 is None else f'{ui_y4:.1f}'
+            r4_a = '--' if robot4_filtered_angle is None else f'{robot4_filtered_angle:.1f}'
 
             robot_rows = [
                 (robot_id, r1_x, r1_y, r1_a, GREEN, SIDE_Y + 184),
                 (robot2_id, r2_x, r2_y, r2_a, CYAN, SIDE_Y + 209),
                 (robot3_id, r3_x, r3_y, r3_a, (200, 120, 230), SIDE_Y + 234),
+                (robot4_id, r4_x, r4_y, r4_a, (80, 180, 180), SIDE_Y + 259),
             ]
             for rid, xx, yy, aa, color, row_y in robot_rows:
                 cv2.putText(dashboard, f'R{rid}', (SIDE_X + 28, row_y),
@@ -3057,27 +3351,31 @@ def handle_camera():
             _draw_button(R8_STOP_BUTTON, f'R{robot_id} STOP', RED, not send_robot8_enabled.is_set())
             _draw_button(R8_CLEAR_BUTTON, f'R{robot_id} CLR PATH', SLATE)
 
-            _draw_button(R7_START_BUTTON, f'R{robot2_id} START', GREEN, send_robot9_enabled.is_set())
-            _draw_button(R7_STOP_BUTTON, f'R{robot2_id} STOP', RED, not send_robot9_enabled.is_set())
+            _draw_button(R7_START_BUTTON, f'R{robot2_id} START', GREEN, send_robot7_enabled.is_set())
+            _draw_button(R7_STOP_BUTTON, f'R{robot2_id} STOP', RED, not send_robot7_enabled.is_set())
             _draw_button(R7_CLEAR_BUTTON, f'R{robot2_id} CLR PATH', SLATE)
 
             _draw_button(R3_START_BUTTON, f'R{robot3_id} START', GREEN, send_robot3_enabled.is_set())
             _draw_button(R3_STOP_BUTTON, f'R{robot3_id} STOP', RED, not send_robot3_enabled.is_set())
             _draw_button(R3_CLEAR_BUTTON, f'R{robot3_id} CLR PATH', SLATE)
 
+            _draw_button(R29_START_BUTTON, f'R{robot4_id} START', GREEN, send_robot29_enabled.is_set())
+            _draw_button(R29_STOP_BUTTON, f'R{robot4_id} STOP', RED, not send_robot29_enabled.is_set())
+            _draw_button(R29_CLEAR_BUTTON, f'R{robot4_id} CLR PATH', SLATE)
+
             # ---------- RUN METRICS ----------
-            metrics_rect = (SIDE_X + 14, SIDE_Y + 392, SIDE_X + 376, SIDE_Y + 514)
+            metrics_rect = (SIDE_X + 14, SIDE_Y + 464, SIDE_X + 376, SIDE_Y + 616)
             _draw_round_rect(dashboard, metrics_rect, CARD_BG, 14, border=CARD_EDGE)
-            cv2.putText(dashboard, 'RUN METRICS', (SIDE_X + 28, SIDE_Y + 415),
+            cv2.putText(dashboard, 'RUN METRICS', (SIDE_X + 28, SIDE_Y + 487),
                         cv2.FONT_HERSHEY_DUPLEX, 0.42, TEXT_MAIN, 1, cv2.LINE_AA)
 
-            cv2.putText(dashboard, 'ROBOT', (SIDE_X + 28, SIDE_Y + 437),
+            cv2.putText(dashboard, 'ROBOT', (SIDE_X + 28, SIDE_Y + 509),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.27, TEXT_SOFT, 1, cv2.LINE_AA)
-            cv2.putText(dashboard, 'DIST', (SIDE_X + 90, SIDE_Y + 437),
+            cv2.putText(dashboard, 'DIST', (SIDE_X + 90, SIDE_Y + 509),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.27, TEXT_SOFT, 1, cv2.LINE_AA)
-            cv2.putText(dashboard, 'SPEED', (SIDE_X + 180, SIDE_Y + 437),
+            cv2.putText(dashboard, 'SPEED', (SIDE_X + 180, SIDE_Y + 509),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.27, TEXT_SOFT, 1, cv2.LINE_AA)
-            cv2.putText(dashboard, 'TIME', (SIDE_X + 292, SIDE_Y + 437),
+            cv2.putText(dashboard, 'TIME', (SIDE_X + 292, SIDE_Y + 509),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.27, TEXT_SOFT, 1, cv2.LINE_AA)
 
             def _format_distance(dist_cm):
@@ -3091,13 +3389,16 @@ def handle_camera():
             metrics_rows = [
                 (robot_id, GREEN, robot_total_distance_cm,
                  _metric_speed(robot_speed_cm_s, robot_last_motion_time),
-                 get_robot_run_seconds(robot_id), SIDE_Y + 462),
+                 get_robot_run_seconds(robot_id), SIDE_Y + 534),
                 (robot2_id, CYAN, robot2_total_distance_cm,
                  _metric_speed(robot2_speed_cm_s, robot2_last_motion_time),
-                 get_robot_run_seconds(robot2_id), SIDE_Y + 486),
+                 get_robot_run_seconds(robot2_id), SIDE_Y + 558),
                 (robot3_id, (200, 120, 230), robot3_total_distance_cm,
                  _metric_speed(robot3_speed_cm_s, robot3_last_motion_time),
-                 get_robot_run_seconds(robot3_id), SIDE_Y + 510),
+                 get_robot_run_seconds(robot3_id), SIDE_Y + 582),
+                (robot4_id, (80, 180, 180), robot4_total_distance_cm,
+                 _metric_speed(robot4_speed_cm_s, robot4_last_motion_time),
+                 get_robot_run_seconds(robot4_id), SIDE_Y + 606),
             ]
 
             for rid, color, dist_value, speed_value, run_sec, row_y in metrics_rows:
@@ -3114,14 +3415,14 @@ def handle_camera():
                               cv2.FONT_HERSHEY_DUPLEX, 0.31, TEXT_MAIN, 1)
 
             # ---------- EVENT LOG ----------
-            log_rect = (SIDE_X + 14, SIDE_Y + 524, SIDE_X + 376, SIDE_Y + 594)
+            log_rect = (SIDE_X + 14, SIDE_Y + 626, SIDE_X + 376, SIDE_Y + 696)
             _draw_round_rect(dashboard, log_rect, CARD_BG, 14, border=CARD_EDGE)
-            cv2.putText(dashboard, 'EVENT LOG', (SIDE_X + 28, SIDE_Y + 547),
+            cv2.putText(dashboard, 'EVENT LOG', (SIDE_X + 28, SIDE_Y + 649),
                         cv2.FONT_HERSHEY_DUPLEX, 0.40, TEXT_MAIN, 1, cv2.LINE_AA)
 
             recent_events = event_log[-2:]
             for row_idx, (stamp, message, event_color) in enumerate(recent_events):
-                yy = SIDE_Y + 570 + row_idx * 18
+                yy = SIDE_Y + 672 + row_idx * 18
                 cv2.putText(dashboard, stamp, (SIDE_X + 28, yy),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.30, TEXT_SOFT, 1, cv2.LINE_AA)
                 _put_fit_text(dashboard, message, (SIDE_X + 95, yy), 250,
@@ -3130,9 +3431,9 @@ def handle_camera():
             # ---------- TARGET WAYPOINTS ----------
             target_card = (
                 SIDE_X + 14,
-                SIDE_Y + 604,
+                SIDE_Y + 706,
                 SIDE_X + 376,
-                SIDE_Y + 748
+                SIDE_Y + 860
             )
             _draw_round_rect(
                 dashboard,
@@ -3148,7 +3449,7 @@ def handle_camera():
             cv2.putText(
                 dashboard,
                 'TARGET POINTS - 1 PACKET',
-                (SIDE_X + 28, SIDE_Y + 626),
+                (SIDE_X + 28, SIDE_Y + 728),
                 cv2.FONT_HERSHEY_DUPLEX,
                 0.40,
                 TEXT_MAIN,
@@ -3175,6 +3476,13 @@ def handle_camera():
                 'R3 TARGET',
                 (200, 120, 230),
                 selected_target_robot == robot3_id
+            )
+
+            _draw_button(
+                TARGET_R29_BUTTON,
+                'R29 TARGET',
+                (80, 180, 180),
+                selected_target_robot == robot4_id
             )
 
             _draw_button(
@@ -3206,7 +3514,7 @@ def handle_camera():
             _put_fit_text(
                 dashboard,
                 waypoint_status,
-                (SIDE_X + 28, SIDE_Y + 738),
+                (SIDE_X + 28, SIDE_Y + 850),
                 330,
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.32,
@@ -3354,16 +3662,12 @@ def handle_camera():
 
             cv2.imshow(DASHBOARD_WINDOW, dashboard)
 
-        # =================================================================
         # XỬ LÝ PHÍM BẤM BÀN PHÍM
-        # =================================================================
         key_press = cv2.waitKey(1) & 0xFF
         action = ui_state.get('action')
         ui_state['action'] = None
 
-        # ============================================================
         # PHÍM ZOOM MAP
-        # ============================================================
         if key_press in (ord('+'), ord('=')):
             _apply_zoom(float(ui_state['zoom']) * MAP_ZOOM_STEP)
 
@@ -3386,6 +3690,9 @@ def handle_camera():
         elif key_press == ord('3'):
             ui_state['target_robot'] = robot3_id
 
+        elif key_press == ord('4'):
+            ui_state['target_robot'] = robot4_id
+
         elif key_press in (10, 13):
             ui_state['action'] = 'send_target_path'
             action = 'send_target_path'
@@ -3401,9 +3708,7 @@ def handle_camera():
         if action == 'quit':
             break
 
-        # ============================================================
         # WAYPOINT ACTIONS
-        # ============================================================
         if action == 'target_point_added':
             selected_rid = ui_state['target_robot']
             point_count = len(target_waypoints[selected_rid])
@@ -3423,12 +3728,10 @@ def handle_camera():
                 _add_event(f'R{selected_rid} target undo', TEXT_MUTED)
 
         elif action == 'clear_target_path':
-            # ========================================================
             # CLEAR TARGET:
             # - Xóa các điểm đích đã chấm của robot đang chọn.
             # - Gửi WPCLR# tới đúng robot để Arduino Mega xóa target cũ.
             # - KHÔNG xóa đường robot đã chạy trên map.
-            # ========================================================
             selected_rid = ui_state['target_robot']
             target_waypoints[selected_rid].clear()
 
@@ -3458,10 +3761,10 @@ def handle_camera():
         elif action == 'stop_r8':
             stop_robot_output(robot_id)
             _add_event(f'R{robot_id} STOP sent', TEXT_MUTED)
-        elif action == 'start_r9':
+        elif action == 'start_r7':
             if start_robot_output(robot2_id):
                 _add_event(f'R{robot2_id} START sent', GREEN)
-        elif action == 'stop_r9':
+        elif action == 'stop_r7':
             stop_robot_output(robot2_id)
             _add_event(f'R{robot2_id} STOP sent', TEXT_MUTED)
         elif action == 'start_r3':
@@ -3470,8 +3773,13 @@ def handle_camera():
         elif action == 'stop_r3':
             stop_robot_output(robot3_id)
             _add_event(f'R{robot3_id} STOP sent', TEXT_MUTED)
+        elif action == 'start_r29':
+            if start_robot_output(robot4_id):
+                _add_event(f'R{robot4_id} START sent', GREEN)
+        elif action == 'stop_r29':
+            stop_robot_output(robot4_id)
+            _add_event(f'R{robot4_id} STOP sent', TEXT_MUTED)
 
-        # ============================================================
         # CLEAR PATH CHỈ XÓA QUỸ ĐẠO / METRICS.
         # KHÁC HOÀN TOÀN VỚI CLEAR TARGET.
         #
@@ -3479,10 +3787,8 @@ def handle_camera():
         #   - gửi WPCLR#
         #   - clear send_robot*_enabled
         #   - gửi STOP# tới ESP32
-        #   - xóa shared_queue
         #
         # Như vậy robot đang START vẫn tiếp tục truyền sau khi bấm CLEAR.
-        # ============================================================
 
         if action == 'clear_r8':
             # Ghi nhớ trạng thái truyền hiện tại để đảm bảo CLEAR không làm thay đổi.
@@ -3509,8 +3815,8 @@ def handle_camera():
                 f"| SEND={'ON' if send_robot8_enabled.is_set() else 'OFF'}"
             )
 
-        elif action == 'clear_r9':
-            r9_was_sending = send_robot9_enabled.is_set()
+        elif action == 'clear_r7':
+            r7_was_sending = send_robot7_enabled.is_set()
 
             robot2_path.clear()
             robot2_total_distance_cm = 0.0
@@ -3519,8 +3825,8 @@ def handle_camera():
 
             map_with_paths = _rebuild_cached_paths()
 
-            if r9_was_sending:
-                send_robot9_enabled.set()
+            if r7_was_sending:
+                send_robot7_enabled.set()
 
             _add_event(
                 f'R{robot2_id} path cleared - send unchanged',
@@ -3528,7 +3834,7 @@ def handle_camera():
             )
             _debug_print(
                 f">>> DA XOA QUY DAO ROBOT ID {robot2_id} "
-                f"| SEND={'ON' if send_robot9_enabled.is_set() else 'OFF'}"
+                f"| SEND={'ON' if send_robot7_enabled.is_set() else 'OFF'}"
             )
 
         elif action == 'clear_r3':
@@ -3553,44 +3859,75 @@ def handle_camera():
                 f"| SEND={'ON' if send_robot3_enabled.is_set() else 'OFF'}"
             )
 
-        # Phím C: xóa cả ba quỹ đạo nhưng vẫn giữ nguyên trạng thái truyền.
+
+        elif action == 'clear_r29':
+            r29_was_sending = send_robot29_enabled.is_set()
+
+            robot4_path.clear()
+            robot4_total_distance_cm = 0.0
+            robot4_speed_cm_s = 0.0
+            robot4_last_motion_time = None
+
+            map_with_paths = _rebuild_cached_paths()
+
+            if r29_was_sending:
+                send_robot29_enabled.set()
+
+            _add_event(
+                f'R{robot4_id} path cleared - send unchanged',
+                (80, 180, 180)
+            )
+            _debug_print(
+                f">>> DA XOA QUY DAO ROBOT ID {robot4_id} "
+                f"| SEND={'ON' if send_robot29_enabled.is_set() else 'OFF'}"
+            )
+
+        # Phím C: xóa cả bốn quỹ đạo nhưng vẫn giữ nguyên trạng thái truyền.
         elif key_press in (ord('c'), ord('C')):
             r8_was_sending = send_robot8_enabled.is_set()
-            r9_was_sending = send_robot9_enabled.is_set()
+            r7_was_sending = send_robot7_enabled.is_set()
             r3_was_sending = send_robot3_enabled.is_set()
+            r29_was_sending = send_robot29_enabled.is_set()
 
             robot_path.clear()
             robot2_path.clear()
             robot3_path.clear()
+            robot4_path.clear()
 
             map_with_paths = base_map.copy()
 
             robot_total_distance_cm = 0.0
             robot2_total_distance_cm = 0.0
             robot3_total_distance_cm = 0.0
+            robot4_total_distance_cm = 0.0
 
             robot_speed_cm_s = 0.0
             robot2_speed_cm_s = 0.0
             robot3_speed_cm_s = 0.0
+            robot4_speed_cm_s = 0.0
 
             robot_last_motion_time = None
             robot2_last_motion_time = None
             robot3_last_motion_time = None
+            robot4_last_motion_time = None
 
             # CLEAR không làm thay đổi START/STOP.
             if r8_was_sending:
                 send_robot8_enabled.set()
-            if r9_was_sending:
-                send_robot9_enabled.set()
+            if r7_was_sending:
+                send_robot7_enabled.set()
             if r3_was_sending:
                 send_robot3_enabled.set()
+            if r29_was_sending:
+                send_robot29_enabled.set()
 
-            _add_event('All 3 paths cleared - send unchanged', CYAN)
+            _add_event('All 4 paths cleared - send unchanged', CYAN)
             _debug_print(
-                ">>> DA XOA QUY DAO CUA CA 3 ROBOT "
+                ">>> DA XOA QUY DAO CUA CA 4 ROBOT "
                 f"| R8 SEND={'ON' if send_robot8_enabled.is_set() else 'OFF'} "
-                f"| R7 SEND={'ON' if send_robot9_enabled.is_set() else 'OFF'} "
-                f"| R3 SEND={'ON' if send_robot3_enabled.is_set() else 'OFF'}"
+                f"| R7 SEND={'ON' if send_robot7_enabled.is_set() else 'OFF'} "
+                f"| R3 SEND={'ON' if send_robot3_enabled.is_set() else 'OFF'} "
+                f"| R29 SEND={'ON' if send_robot29_enabled.is_set() else 'OFF'}"
             )
 
         # E: CALIB CAM2
@@ -3608,24 +3945,21 @@ def handle_camera():
                 ids2_flat = ids2.flatten().tolist()
 
                 for markerCorner2, markerID in zip(corners2, ids2_flat):
-                    # Không dùng hai robot đang di chuyển làm điểm calibration.
+                    # Không dùng marker robot làm điểm calibration.
                     if markerID in ROBOT_IDS:
                         continue
                     if markerID not in ids1_flat or markerID in used_marker_ids:
                         continue
 
-                    # Tâm marker trong ảnh Camera 2.
-                    c2 = markerCorner2.reshape((4, 2))
-                    cx2 = float(np.mean(c2[:, 0]))
-                    cy2 = float(np.mean(c2[:, 1]))
-
-                    # Tâm cùng marker trong ảnh Camera 1.
+                    center2 = get_marker_center(markerCorner2)
                     idx1 = ids1_flat.index(markerID)
-                    c1 = corners[idx1].reshape((4, 2))
-                    cx1 = float(np.mean(c1[:, 0]))
-                    cy1 = float(np.mean(c1[:, 1]))
+                    center1 = get_marker_center(corners[idx1])
+                    if center1 is None or center2 is None:
+                        continue
 
-                    # Camera 1 cung cấp tọa độ thực tương ứng.
+                    cx2, cy2 = center2
+                    cx1, cy1 = center1
+
                     real_pt = transform_point_with_homography(
                         (cx1, cy1), matrix_cam1_to_real
                     )
@@ -3664,8 +3998,6 @@ def handle_camera():
                 else:
                     # Chỉ cập nhật khi H mới vượt qua toàn bộ kiểm tra.
                     matrix_cam2_to_real = H_candidate
-                    img_points2 = metrics['src_inliers']
-                    real_points2 = metrics['dst_inliers']
 
                     os.makedirs(os.path.dirname(HOMOGRAPHY_CAM2_FILE), exist_ok=True)
                     with open(HOMOGRAPHY_CAM2_FILE, 'wb') as f:
@@ -3709,9 +4041,7 @@ def handle_camera():
     cv2.destroyAllWindows()
 
 
-# ============================================================
 # LUỒNG TRUYỀN CỐ ĐỊNH - ĐỘC LẬP FPS CAMERA
-# ============================================================
 def send_data():
     global ser
 
@@ -3738,8 +4068,9 @@ def send_data():
         # Snapshot cực nhanh, sau đó nhả lock ngay.
         with latest_packet_lock:
             packet8 = latest_robot_packets.get(robot_id)
-            packet9 = latest_robot_packets.get(robot2_id)
+            packet7 = latest_robot_packets.get(robot2_id)
             packet3 = latest_robot_packets.get(robot3_id)
+            packet29 = latest_robot_packets.get(robot4_id)
 
         packets = []
 
@@ -3750,16 +4081,22 @@ def send_data():
             packets.append(packet8)
 
         if (
-            send_robot9_enabled.is_set()
-            and packet9 is not None
+            send_robot7_enabled.is_set()
+            and packet7 is not None
         ):
-            packets.append(packet9)
+            packets.append(packet7)
 
         if (
             send_robot3_enabled.is_set()
             and packet3 is not None
         ):
             packets.append(packet3)
+
+        if (
+            send_robot29_enabled.is_set()
+            and packet29 is not None
+        ):
+            packets.append(packet29)
 
         if packets:
             if ser is None or not ser.is_open:
@@ -3791,16 +4128,6 @@ def send_data():
                     ser = None
 
 
-
-def _clear_shared_queue():
-    while True:
-        try:
-            shared_queue.get_nowait()
-        except queue.Empty:
-            break
-
-
-
 def _send_immediate_packet(packet_text):
     """Gửi một packet điều khiển ngay qua Serial, dùng chung serial_lock."""
     global ser
@@ -3819,9 +4146,7 @@ def _send_immediate_packet(packet_text):
         return False
 
 
-# ============================================================
 # ESP-NOW SINGLE-PACKET WAYPOINT
-# ============================================================
 # Giữ dưới 240 byte để an toàn với ESP-NOW v1.0 (giới hạn 250 byte).
 # Gateway sẽ bỏ "ID;" trước khi phát ESP-NOW, nên phép kiểm tra bên dưới
 # kiểm tra đúng phần payload mà ESP32 receiver thực sự nhận.
@@ -3958,11 +4283,11 @@ def stop_robot_output(target_robot_id):
 
 
 def stop_all_robot_outputs():
-    """Dừng cả ba robot khi thoát chương trình."""
+    """Dừng cả bốn robot khi thoát chương trình."""
     stop_robot_output(robot_id)
     stop_robot_output(robot2_id)
     stop_robot_output(robot3_id)
-    _clear_shared_queue()
+    stop_robot_output(robot4_id)
     return True
 
 def main():
