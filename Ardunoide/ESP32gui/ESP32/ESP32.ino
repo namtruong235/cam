@@ -32,7 +32,7 @@ uint8_t robot29Mac[] = {
 // Python gui:
 //   8;START#
 //   8;STOP#
-//   8;352.4;64.7;43.2#
+//   8;352.4;64.7;0.75400#
 //
 // Danh sach diem dich trong MOT packet, KHONG co so luong:
 //   8;WPLIST;100.0;80.0;120.0;60.0;140.0;80.0#
@@ -42,22 +42,22 @@ uint8_t robot29Mac[] = {
 //
 //   7;START#
 //   7;STOP#
-//   7;420.8;80.1;271.6#
+//   7;420.8;80.1;-1.54300#
 //
 //   3;START#
 //   3;STOP#
-//   3;500.2;40.0;90.0#
+//   3;500.2;40.0;1.57080#
 //
 //   29;START#
 //   29;STOP#
-//   29;510.0;60.0;180.0#
+//   29;510.0;60.0;3.14159#
 //
 // Gateway doc ID dau packet, chon dung MAC,
 // sau do BO ID va gui phan con lai cho ESP32 tren robot.
 //
 // Vi du:
-// Python:  8;352.4;64.7;43.2#
-// ESP-NOW: 352.4;64.7;43.2# -> robot ID 8
+// Python:  8;352.4;64.7;0.75400#
+// ESP-NOW: 352.4;64.7;0.75400# -> robot ID 8
 // ======================================================
 
 char serialBuffer[320];
@@ -205,7 +205,7 @@ void processSerialPacket(char *packet)
     // Packet co dang:
     // 8;START#
     // 8;STOP#
-    // 8;352.4;64.7;43.2#
+    // 8;352.4;64.7;0.75400#
 
     char *separator = strchr(packet, ';');
 
