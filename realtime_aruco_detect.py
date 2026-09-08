@@ -1,7 +1,8 @@
 # FOUR ROBOT VERSION
 # Robot IDs: 8, 7, 3, 29
-# Serial packet: ID;X;Y;ANGLE#
-# Example: 8;352.4;64.7;43.2#29;510.0;60.0;180.0#
+# Serial packet: ID;X;Y;ANGLE_RAD#
+# Angle is radians in [-pi, pi].
+# Example: 8;352.4;64.7;0.75400#29;510.0;60.0;3.14159#
 
 import threading
 import math
@@ -24,6 +25,14 @@ def _debug_print(*args, **kwargs):
         builtins.print(*args, **kwargs)
 
 
+def _calib_print(*args, **kwargs):
+    """Luôn in riêng kết quả calibration H2 ra Run/Console.
+
+    Không phụ thuộc ENABLE_CONSOLE_LOG để tránh phải bật toàn bộ debug log.
+    """
+    builtins.print(*args, **kwargs, flush=True)
+
+
 # ArUco dictionary used by the project.
 arucoDict = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_100)
 def _make_aruco_params():
@@ -39,12 +48,27 @@ def _make_aruco_params():
 arucoParams = _make_aruco_params()
 arucoParamsCam2 = _make_aruco_params()
 
-# ================= HOMOGRAPHY ỔN ĐỊNH CHO HAI CAMERA =================
-HOMOGRAPHY_CAM2_FILE = 'calib_values2/homography_cam2_to_real.pkl'
+# Camera 2 calibration mới (RMS ~0.226 px).
+# p_matrix.pkl của pipeline calibration hiện tại thực chất là new camera matrix 3x3.
+CAM2_K_FILE = 'calib_values2_new/k_matrix.pkl'
+CAM2_D_FILE = 'calib_values2_new/dist_coef.pkl'
+CAM2_NEW_K_FILE = 'calib_values2_new/p_matrix.pkl'
+
+# H2 này thuộc HỆ PIXEL CAM2 ĐÃ UNDISTORT.
+# Bản full-corner dùng file riêng để không nạp nhầm H2 center/pose cũ.
+HOMOGRAPHY_CAM2_FILE = 'calib_values2_new/homography_cam2_to_real_fullcorners.pkl'
 RANSAC_REPROJ_THRESHOLD_CM = 2.0
 MIN_INLIER_RATIO = 0.75
 MAX_HOMOGRAPHY_RMSE_CM = 2.0
 MIN_SINGULAR_GAP = 1.2
+# RANSAC Cam2-undistorted pixel -> Cam1 raw pixel bằng toàn bộ corner ArUco.
+INTERCAM_RANSAC_THRESHOLD_PX = 3.0
+MAX_INTERCAM_RMSE_PX = 3.0
+
+# Homography Camera 2: thu nhiều frame rồi lấy median riêng cho từng corner.
+H2_CALIB_COLLECT_FRAMES = 60
+H2_CALIB_MIN_VALID_SAMPLES = 40
+H2_CALIB_FRAME_INTERVAL_SEC = 1.0 / 30.0
 
 # ================= HỢP NHẤT ROBOT TRONG VÙNG CHỒNG LẤN =================
 # Giữ nguyên camera đang theo dõi khi cả hai camera cùng nhìn thấy robot.
@@ -106,15 +130,54 @@ def get_marker_center(marker_corner):
     return float(center[0]), float(center[1])
 
 
+def load_cam2_calibration():
+    """Load K2, D2 và newK2 dùng cho hệ pixel Camera 2 đã khử méo."""
+    required = (CAM2_K_FILE, CAM2_D_FILE, CAM2_NEW_K_FILE)
+    missing = [path for path in required if not os.path.exists(path)]
+    if missing:
+        raise FileNotFoundError(
+            'Thiếu calibration Camera 2: ' + ', '.join(missing)
+        )
+
+    with open(CAM2_K_FILE, 'rb') as f:
+        K2 = np.asarray(pickle.load(f), dtype=np.float64)
+    with open(CAM2_D_FILE, 'rb') as f:
+        D2 = np.asarray(pickle.load(f), dtype=np.float64)
+    with open(CAM2_NEW_K_FILE, 'rb') as f:
+        newK2 = np.asarray(pickle.load(f), dtype=np.float64)
+
+    if K2.shape != (3, 3) or newK2.shape != (3, 3):
+        raise ValueError('K2/newK2 phải là ma trận 3x3.')
+    if D2.size < 4:
+        raise ValueError('D2 không hợp lệ.')
+    if not (np.all(np.isfinite(K2)) and np.all(np.isfinite(D2)) and np.all(np.isfinite(newK2))):
+        raise ValueError('Calibration Camera 2 chứa NaN/Inf.')
+
+    return K2, D2, newK2
+
+
+def undistort_marker_corners(marker_corner, K, D, new_K):
+    """Đổi 4 corner RAW sang hệ pixel đã undistort, giữ sub-pixel."""
+    try:
+        pts = np.asarray(marker_corner, dtype=np.float64).reshape(4, 1, 2)
+        corrected = cv2.undistortPoints(pts, K, D, P=new_K)
+        corrected = corrected.reshape(1, 4, 2)
+        if not np.all(np.isfinite(corrected)):
+            return None
+        return corrected
+    except (cv2.error, ValueError):
+        return None
+
+
 def get_marker_world_angle(marker_corner, H):
     """
-    Tính góc quay của marker trong hệ tọa độ thực.
+    Tính góc quay của marker trong hệ tọa độ thực, trả về radian [-pi, pi].
 
     Quy ước:
-        0°   = +X
-        90°  = +Y
-        180° = -X
-        270° = -Y
+        0       = +X
+        pi / 2  = +Y
+        pi      = -X
+        -pi / 2 = -Y
 
     Coi cạnh trên của ArUco là hướng đầu robot.
     """
@@ -149,21 +212,24 @@ def get_marker_world_angle(marker_corner, H):
         dx = float(top_mid[0] - bottom_mid[0])
         dy = float(top_mid[1] - bottom_mid[1])
 
-        angle = math.degrees(math.atan2(dy, dx))
+        angle = math.atan2(dy, dx)
 
-        # Chuyển [-180, 180] -> [0, 360)
-        angle = (angle + 360.0) % 360.0
-
+        # math.atan2 already returns radians in [-pi, pi].
         return angle
 
     except (cv2.error, ValueError):
         return None
 
 
-def smooth_angle_deg(old_angle, new_angle, alpha=0.35):
+def _normalize_angle_rad(angle):
+    """Normalize an angle to [-pi, pi)."""
+    return (float(angle) + math.pi) % (2.0 * math.pi) - math.pi
+
+
+def smooth_angle_rad(old_angle, new_angle, alpha=0.35):
     """
-    EMA dành riêng cho góc.
-    Xử lý đúng trường hợp 359° -> 1°.
+    EMA dành riêng cho góc radian.
+    Xử lý đúng trường hợp pi -> -pi.
     """
 
     if new_angle is None:
@@ -172,19 +238,19 @@ def smooth_angle_deg(old_angle, new_angle, alpha=0.35):
     if old_angle is None:
         return new_angle
 
-    # Chênh lệch góc ngắn nhất trong [-180, 180]
+    # Chênh lệch góc ngắn nhất trong [-pi, pi).
     delta = (
         new_angle
         - old_angle
-        + 180.0
-    ) % 360.0 - 180.0
+        + math.pi
+    ) % (2.0 * math.pi) - math.pi
 
     result = (
         old_angle
         + alpha * delta
-    ) % 360.0
+    )
 
-    return result
+    return _normalize_angle_rad(result)
 
 
 def _normalize_points_for_dlt(points):
@@ -355,6 +421,166 @@ def estimate_homography_checked(src_points, dst_points):
         'dst_inliers': dst_inliers.astype(np.float32)
     }
     return H_refined.astype(np.float64), mask, metrics, ''
+
+
+def estimate_intercamera_homography_checked(
+    src_points_cam2,
+    dst_points_cam1,
+    matrix_cam1_to_real
+):
+    """
+    Ước lượng phép ghép Camera 2 -> Camera 1 bằng các CORNER ArUco chung.
+
+    src_points_cam2 : corner Camera 2 SAU UNDISTORT (pixel hệ newK2)
+    dst_points_cam1 : corner tương ứng Camera 1 RAW (pixel)
+
+    Sau khi có H21 (Cam2 -> Cam1), dựng:
+        H2 = H1 @ H21
+    để Camera 2 đi vào đúng cùng hệ tọa độ thực với Camera 1.
+    """
+    src = np.asarray(src_points_cam2, dtype=np.float64).reshape(-1, 2)
+    dst = np.asarray(dst_points_cam1, dtype=np.float64).reshape(-1, 2)
+    H1 = np.asarray(matrix_cam1_to_real, dtype=np.float64).reshape(3, 3)
+
+    if len(src) != len(dst):
+        return None, None, {}, 'Hai tập corner không cùng số lượng.'
+    if len(src) < 4:
+        return None, None, {}, 'Cần ít nhất 4 cặp corner.'
+    if not np.all(np.isfinite(src)) or not np.all(np.isfinite(dst)):
+        return None, None, {}, 'Tập corner chứa NaN/Inf.'
+    if not np.all(np.isfinite(H1)) or np.linalg.matrix_rank(H1) < 3:
+        return None, None, {}, 'H1 không hợp lệ.'
+
+    # Vì đây đều là pixel, yêu cầu cả hai tập phủ đủ một vùng 2D.
+    ok, reason = _check_point_distribution(src, 20.0, 20.0)
+    if not ok:
+        return None, None, {}, 'Corner Camera 2 không hợp lệ: ' + reason
+    ok, reason = _check_point_distribution(dst, 20.0, 20.0)
+    if not ok:
+        return None, None, {}, 'Corner Camera 1 không hợp lệ: ' + reason
+
+    # H21 chỉ mô tả phép ghép giữa hai ảnh trên cùng mặt phẳng sàn.
+    H21, mask = cv2.findHomography(
+        src,
+        dst,
+        cv2.RANSAC,
+        INTERCAM_RANSAC_THRESHOLD_PX,
+        maxIters=5000,
+        confidence=0.995
+    )
+    if H21 is None or mask is None:
+        return None, None, {}, 'OpenCV không tìm được H Cam2->Cam1.'
+
+    inlier_mask = mask.ravel().astype(bool)
+    inlier_count = int(inlier_mask.sum())
+    required_inliers = max(4, int(np.ceil(MIN_INLIER_RATIO * len(src))))
+    if inlier_count < required_inliers:
+        return None, mask, {
+            'inliers': inlier_count,
+            'total': len(src),
+            'inlier_ratio': inlier_count / len(src)
+        }, f'Quá ít corner inlier: {inlier_count}/{len(src)}, cần ít nhất {required_inliers}.'
+
+    src_inliers = src[inlier_mask]
+    dst_inliers = dst[inlier_mask]
+
+    ok, reason = _check_point_distribution(src_inliers, 20.0, 20.0)
+    if not ok:
+        return None, mask, {}, 'Corner inlier Camera 2 bị suy biến: ' + reason
+    ok, reason = _check_point_distribution(dst_inliers, 20.0, 20.0)
+    if not ok:
+        return None, mask, {}, 'Corner inlier Camera 1 bị suy biến: ' + reason
+
+    # Tinh chỉnh lại bằng toàn bộ corner được RANSAC xác nhận.
+    H21_refined, _ = cv2.findHomography(src_inliers, dst_inliers, 0)
+    if H21_refined is None or not np.all(np.isfinite(H21_refined)):
+        return None, mask, {}, 'Không thể tinh chỉnh H Cam2->Cam1.'
+
+    if abs(H21_refined[2, 2]) > 1e-12:
+        H21_refined = H21_refined / H21_refined[2, 2]
+    else:
+        H21_refined = H21_refined / max(np.linalg.norm(H21_refined), 1e-12)
+
+    if np.linalg.matrix_rank(H21_refined) < 3:
+        return None, mask, {}, 'H Cam2->Cam1 bị suy biến.'
+
+    pixel_errors = _reprojection_errors(H21_refined, src_inliers, dst_inliers)
+    pixel_rmse = float(np.sqrt(np.mean(pixel_errors ** 2)))
+    pixel_max = float(np.max(pixel_errors))
+    if pixel_rmse > MAX_INTERCAM_RMSE_PX:
+        return None, mask, {
+            'inliers': inlier_count,
+            'total': len(src),
+            'pixel_rmse_px': pixel_rmse,
+            'pixel_max_px': pixel_max
+        }, f'Sai số ghép Cam2->Cam1 quá lớn: RMSE={pixel_rmse:.2f} px.'
+
+    # Kiểm tra điều kiện hình học của H21 bằng DLT chuẩn hóa.
+    A = _build_dlt_matrix(src_inliers, dst_inliers)
+    _, singular_values, _ = np.linalg.svd(A, full_matrices=True)
+    rank_A = int(np.linalg.matrix_rank(A))
+    if len(src_inliers) == 4:
+        if rank_A < 8:
+            return None, mask, {}, f'Dữ liệu suy biến: rank(A)={rank_A}, cần 8.'
+        singular_gap = float('inf')
+    else:
+        if len(singular_values) < 2:
+            return None, mask, {}, 'Không đủ giá trị kỳ dị để đánh giá H21.'
+        singular_gap = float(singular_values[-2] / max(singular_values[-1], 1e-12))
+        if singular_gap < MIN_SINGULAR_GAP:
+            return None, mask, {
+                'singular_gap': singular_gap,
+                'rank_A': rank_A
+            }, f'H Cam2->Cam1 không ổn định (singular gap={singular_gap:.2f}).'
+
+    # Ghép với H1 đã được kiểm chứng tốt trên sân.
+    H2 = H1 @ H21_refined
+    if not np.all(np.isfinite(H2)):
+        return None, mask, {}, 'H2 sau khi ghép H1 @ H21 chứa NaN/Inf.'
+    if abs(H2[2, 2]) > 1e-12:
+        H2 = H2 / H2[2, 2]
+    else:
+        H2 = H2 / max(np.linalg.norm(H2), 1e-12)
+    if np.linalg.matrix_rank(H2) < 3:
+        return None, mask, {}, 'H2 sau khi ghép bị suy biến.'
+
+    # Đánh giá trong hệ tọa độ thật: cùng một physical corner nhìn từ hai camera
+    # phải cho cùng X,Y sau khi qua H1 và H2.
+    cam1_world = cv2.perspectiveTransform(
+        dst_inliers.reshape(-1, 1, 2), H1
+    ).reshape(-1, 2)
+    cam2_world = cv2.perspectiveTransform(
+        src_inliers.reshape(-1, 1, 2), H2
+    ).reshape(-1, 2)
+    world_errors = np.linalg.norm(cam2_world - cam1_world, axis=1)
+    world_rmse = float(np.sqrt(np.mean(world_errors ** 2)))
+    world_max = float(np.max(world_errors))
+
+    if world_rmse > MAX_HOMOGRAPHY_RMSE_CM:
+        return None, mask, {
+            'inliers': inlier_count,
+            'total': len(src),
+            'pixel_rmse_px': pixel_rmse,
+            'pixel_max_px': pixel_max,
+            'world_rmse_cm': world_rmse,
+            'world_max_cm': world_max
+        }, f'Sai số đồng nhất tọa độ quá lớn: RMSE={world_rmse:.2f} cm.'
+
+    metrics = {
+        'inliers': inlier_count,
+        'total': len(src),
+        'inlier_ratio': inlier_count / len(src),
+        'pixel_rmse_px': pixel_rmse,
+        'pixel_max_px': pixel_max,
+        'world_rmse_cm': world_rmse,
+        'world_max_cm': world_max,
+        'rank_A': rank_A,
+        'singular_gap': singular_gap,
+        'H_cam2_to_cam1': H21_refined.astype(np.float64),
+        'src_inliers': src_inliers.astype(np.float32),
+        'dst_inliers': dst_inliers.astype(np.float32)
+    }
+    return H2.astype(np.float64), mask, metrics, ''
 
 
 # com_port = 'COM8'
@@ -546,17 +772,21 @@ def handle_camera():
             if self.stream.isOpened():
                 self.stream.release()
 
-    # Bật công tắc cho luồng camera chạy
+    # Camera 2: load calibration trước khi tracking.
+    K2, D2, newK2 = load_cam2_calibration()
+
     cam_stream = CameraStream(0).start()
     cam_stream2 = CameraStream(2).start()
-    time.sleep(1)  # Chờ 1 giây cho luồng ổn định trước khi chạy tiếp
+    time.sleep(1)
 
     # ================= KHỞI TẠO HỆ TRỤC TỌA ĐỘ GỐC =================
     CAM1_WIDTH = 240  #
     MAP_WIDTH = 540  # Tổng chiều rộng sân hiển thị 0-540 cm
     MAP_HEIGHT = 120  # Trục Oy dài 120 cm
 
-    # H Camera 2 -> hệ tọa độ thực (cm). Được tính khi bấm E và lưu ra file.
+    # H Camera 2 UNDISTORTED pixel -> hệ tọa độ thực (cm).
+    # H2 = H1 @ H(Cam2-undist -> Cam1-raw), fit từ median 4 corner của các ArUco chung.
+    # Nếu chưa có file này, bấm E để thu 60 frame và tạo H2 full-corner.
     matrix_cam2_to_real = None
     # TỌA ĐỘ PIXEL TRÊN MÀN HÌNH (Lấy chuẩn từ ảnh)
     img_points = np.array([
@@ -712,7 +942,7 @@ def handle_camera():
     SIDE_PANEL_WIDTH = 390
     SLIDER_H = 42
     DASHBOARD_WIDTH = UI_PAD + MAP_VIEW_WIDTH + UI_PAD + SIDE_PANEL_WIDTH + UI_PAD
-    DASHBOARD_HEIGHT = HEADER_H + UI_PAD + MAP_VIEW_HEIGHT + SLIDER_H + UI_PAD + 150
+    DASHBOARD_HEIGHT = HEADER_H + UI_PAD + MAP_VIEW_HEIGHT + SLIDER_H + UI_PAD
     BACKGROUND_MAX_SCROLL_X = max(0, MAP_CANVAS_WIDTH - MAP_VIEW_WIDTH)
 
     MAP_X = UI_PAD
@@ -745,34 +975,34 @@ def handle_camera():
     MAP_TEXT = (112, 103, 94)
 
     # Nút điều khiển riêng cho 4 robot.
-    R8_START_BUTTON = (SIDE_X + 18, SIDE_Y + 278, SIDE_X + 128, SIDE_Y + 316)
-    R8_STOP_BUTTON  = (SIDE_X + 136, SIDE_Y + 278, SIDE_X + 246, SIDE_Y + 316)
-    R8_CLEAR_BUTTON = (SIDE_X + 254, SIDE_Y + 278, SIDE_X + 372, SIDE_Y + 316)
+    R8_START_BUTTON = (SIDE_X + 18, SIDE_Y + 258, SIDE_X + 128, SIDE_Y + 290)
+    R8_STOP_BUTTON  = (SIDE_X + 136, SIDE_Y + 258, SIDE_X + 246, SIDE_Y + 290)
+    R8_CLEAR_BUTTON = (SIDE_X + 254, SIDE_Y + 258, SIDE_X + 372, SIDE_Y + 290)
 
-    R7_START_BUTTON = (SIDE_X + 18, SIDE_Y + 324, SIDE_X + 128, SIDE_Y + 362)
-    R7_STOP_BUTTON  = (SIDE_X + 136, SIDE_Y + 324, SIDE_X + 246, SIDE_Y + 362)
-    R7_CLEAR_BUTTON = (SIDE_X + 254, SIDE_Y + 324, SIDE_X + 372, SIDE_Y + 362)
+    R7_START_BUTTON = (SIDE_X + 18, SIDE_Y + 296, SIDE_X + 128, SIDE_Y + 328)
+    R7_STOP_BUTTON  = (SIDE_X + 136, SIDE_Y + 296, SIDE_X + 246, SIDE_Y + 328)
+    R7_CLEAR_BUTTON = (SIDE_X + 254, SIDE_Y + 296, SIDE_X + 372, SIDE_Y + 328)
 
-    R3_START_BUTTON = (SIDE_X + 18, SIDE_Y + 370, SIDE_X + 128, SIDE_Y + 408)
-    R3_STOP_BUTTON  = (SIDE_X + 136, SIDE_Y + 370, SIDE_X + 246, SIDE_Y + 408)
-    R3_CLEAR_BUTTON = (SIDE_X + 254, SIDE_Y + 370, SIDE_X + 372, SIDE_Y + 408)
+    R3_START_BUTTON = (SIDE_X + 18, SIDE_Y + 334, SIDE_X + 128, SIDE_Y + 366)
+    R3_STOP_BUTTON  = (SIDE_X + 136, SIDE_Y + 334, SIDE_X + 246, SIDE_Y + 366)
+    R3_CLEAR_BUTTON = (SIDE_X + 254, SIDE_Y + 334, SIDE_X + 372, SIDE_Y + 366)
 
-    R29_START_BUTTON = (SIDE_X + 18, SIDE_Y + 416, SIDE_X + 128, SIDE_Y + 454)
-    R29_STOP_BUTTON  = (SIDE_X + 136, SIDE_Y + 416, SIDE_X + 246, SIDE_Y + 454)
-    R29_CLEAR_BUTTON = (SIDE_X + 254, SIDE_Y + 416, SIDE_X + 372, SIDE_Y + 454)
+    R29_START_BUTTON = (SIDE_X + 18, SIDE_Y + 372, SIDE_X + 128, SIDE_Y + 404)
+    R29_STOP_BUTTON  = (SIDE_X + 136, SIDE_Y + 372, SIDE_X + 246, SIDE_Y + 404)
+    R29_CLEAR_BUTTON = (SIDE_X + 254, SIDE_Y + 372, SIDE_X + 372, SIDE_Y + 404)
 
     # WAYPOINT CONTROL
-    TARGET_R8_BUTTON  = (SIDE_X + 18,  SIDE_Y + 740, SIDE_X + 100, SIDE_Y + 776)
-    TARGET_R7_BUTTON  = (SIDE_X + 106, SIDE_Y + 740, SIDE_X + 188, SIDE_Y + 776)
-    TARGET_R3_BUTTON  = (SIDE_X + 194, SIDE_Y + 740, SIDE_X + 276, SIDE_Y + 776)
-    TARGET_R29_BUTTON = (SIDE_X + 282, SIDE_Y + 740, SIDE_X + 372, SIDE_Y + 776)
+    TARGET_R8_BUTTON  = (SIDE_X + 18,  SIDE_Y + 658, SIDE_X + 100, SIDE_Y + 686)
+    TARGET_R7_BUTTON  = (SIDE_X + 106, SIDE_Y + 658, SIDE_X + 188, SIDE_Y + 686)
+    TARGET_R3_BUTTON  = (SIDE_X + 194, SIDE_Y + 658, SIDE_X + 276, SIDE_Y + 686)
+    TARGET_R29_BUTTON = (SIDE_X + 282, SIDE_Y + 658, SIDE_X + 372, SIDE_Y + 686)
 
-    TARGET_SEND_BUTTON  = (SIDE_X + 18, SIDE_Y + 786, SIDE_X + 128, SIDE_Y + 822)
-    TARGET_UNDO_BUTTON  = (SIDE_X + 136, SIDE_Y + 786, SIDE_X + 246, SIDE_Y + 822)
-    TARGET_CLEAR_BUTTON = (SIDE_X + 254, SIDE_Y + 786, SIDE_X + 372, SIDE_Y + 822)
+    TARGET_SEND_BUTTON  = (SIDE_X + 18, SIDE_Y + 692, SIDE_X + 128, SIDE_Y + 720)
+    TARGET_UNDO_BUTTON  = (SIDE_X + 136, SIDE_Y + 692, SIDE_X + 246, SIDE_Y + 720)
+    TARGET_CLEAR_BUTTON = (SIDE_X + 254, SIDE_Y + 692, SIDE_X + 372, SIDE_Y + 720)
 
-    CAM1_VIEW_BUTTON = (SIDE_X + 18, SIDE_Y + 875, SIDE_X + 190, SIDE_Y + 911)
-    CAM2_VIEW_BUTTON = (SIDE_X + 200, SIDE_Y + 875, SIDE_X + 372, SIDE_Y + 911)
+    CAM1_VIEW_BUTTON = (SIDE_X + 18, SIDE_Y + 726, SIDE_X + 190, SIDE_Y + 754)
+    CAM2_VIEW_BUTTON = (SIDE_X + 200, SIDE_Y + 726, SIDE_X + 372, SIDE_Y + 754)
     CAM1_WINDOW = 'Camera 1 Preview'
     CAM2_WINDOW = 'Camera 2 Preview'
 
@@ -812,6 +1042,10 @@ def handle_camera():
         'last_mouse_y': 0,
         # None / 'cam1' / 'cam2'
         'camera_view': None,
+
+        # Khi đang thu 60 frame calibration H2, bỏ qua toàn bộ mouse action
+        # để tránh click/stale callback vô tình kích hoạt CLEAR/START/STOP.
+        'calibrating_h2': False,
 
         # Robot đang được chọn để chấm waypoint.
         'target_robot': robot_id,
@@ -1010,6 +1244,11 @@ def handle_camera():
         return px, py
 
     def _mouse_callback(event, mouse_x, mouse_y, flags, _param):
+        # Calibration H2 chạy blocking khoảng 2 giây. Trong thời gian này
+        # không nhận thao tác chuột để action không bị treo sang frame kế tiếp.
+        if ui_state.get('calibrating_h2', False):
+            return
+
         if event == cv2.EVENT_LBUTTONDOWN:
             if _inside(QUIT_BUTTON, mouse_x, mouse_y):
                 ui_state['action'] = 'quit'
@@ -1487,7 +1726,7 @@ def handle_camera():
                         if marker_angle_cam1 is not None:
                             cv2.putText(
                                 img,
-                                f"R{marker_id_int} A={marker_angle_cam1:.1f} deg",
+                                f"R{marker_id_int} A={marker_angle_cam1:.5f} rad",
                                 (center_draw[0] + 10, center_draw[1] + 25),
                                 cv2.FONT_HERSHEY_SIMPLEX,
                                 0.55,
@@ -1529,7 +1768,7 @@ def handle_camera():
                 else:
                     real_map1[key] = real_point
 
-            # 2. XỬ LÝ ẢNH VÀ TỌA ĐỘ CAM 2
+            # 2. CAMERA 2: detect trên RAW, nhưng toàn bộ geometry dùng corner UNDISTORT.
             if len(corners2) > 0:
                 ids2 = ids2.flatten()
                 for idx in ids2:
@@ -1537,16 +1776,27 @@ def handle_camera():
                         positions_map2.update({idx: []})
 
                 for (markerCorner, markerID) in zip(corners2, ids2):
+                    markerCornerUnd = undistort_marker_corners(
+                        markerCorner, K2, D2, newK2
+                    )
+                    if markerCornerUnd is None:
+                        continue
 
-                    c_pts2 = markerCorner.reshape((4, 2))
-                    center2 = get_marker_center(markerCorner)
+                    # Tâm dùng cho Homography được tính sau distortion correction.
+                    center2 = get_marker_center(markerCornerUnd)
                     if center2 is None:
                         continue
                     cX, cY = center2
-                    center_draw2 = (int(round(cX)), int(round(cY)))
+
+                    # Preview vẫn là ảnh RAW, nên chỉ dùng corner/center RAW để vẽ.
+                    c_pts2_raw = np.asarray(markerCorner, dtype=np.float64).reshape(4, 2)
+                    raw_center2 = get_marker_center(markerCorner)
+                    if raw_center2 is None:
+                        raw_center2 = center2
+                    center_draw2 = (int(round(raw_center2[0])), int(round(raw_center2[1])))
 
                     topLeft2, topRight2, bottomRight2, bottomLeft2 = [
-                        tuple(np.rint(p).astype(int)) for p in c_pts2
+                        tuple(np.rint(p).astype(int)) for p in c_pts2_raw
                     ]
 
                     if ui_state['camera_view'] == 'cam2':
@@ -1554,11 +1804,11 @@ def handle_camera():
                         cv2.line(img2, topRight2, bottomRight2, (0, 255, 0), 2)
                         cv2.line(img2, bottomRight2, bottomLeft2, (0, 255, 0), 2)
                         cv2.line(img2, bottomLeft2, topLeft2, (0, 255, 0), 2)
-                    marker_angle_cam2 = None
 
+                    marker_angle_cam2 = None
                     if matrix_cam2_to_real is not None:
                         marker_angle_cam2 = get_marker_world_angle(
-                            markerCorner,
+                            markerCornerUnd,
                             matrix_cam2_to_real
                         )
 
@@ -1593,7 +1843,7 @@ def handle_camera():
                         if marker_angle_cam2 is not None:
                             cv2.putText(
                                 img2,
-                                f"R{marker_id_int} A={marker_angle_cam2:.1f} deg",
+                                f"R{marker_id_int} A={marker_angle_cam2:.5f} rad",
                                 (center_draw2[0] + 10, center_draw2[1] + 25),
                                 cv2.FONT_HERSHEY_SIMPLEX,
                                 0.55,
@@ -1843,7 +2093,7 @@ def handle_camera():
             # 7. LỌC MƯỢT GÓC ROBOT
 
             if selected_angle is not None:
-                robot_filtered_angle = smooth_angle_deg(
+                robot_filtered_angle = smooth_angle_rad(
                     robot_filtered_angle,
                     selected_angle,
                     alpha=0.35
@@ -2070,7 +2320,7 @@ def handle_camera():
                 )
 
             if robot2_selected_angle is not None:
-                robot2_filtered_angle = smooth_angle_deg(
+                robot2_filtered_angle = smooth_angle_rad(
                     robot2_filtered_angle,
                     robot2_selected_angle,
                     alpha=0.35
@@ -2289,7 +2539,7 @@ def handle_camera():
                 )
 
             if robot3_selected_angle is not None:
-                robot3_filtered_angle = smooth_angle_deg(
+                robot3_filtered_angle = smooth_angle_rad(
                     robot3_filtered_angle,
                     robot3_selected_angle,
                     alpha=0.35
@@ -2508,7 +2758,7 @@ def handle_camera():
                 )
 
             if robot4_selected_angle is not None:
-                robot4_filtered_angle = smooth_angle_deg(
+                robot4_filtered_angle = smooth_angle_rad(
                     robot4_filtered_angle,
                     robot4_selected_angle,
                     alpha=0.35
@@ -2550,10 +2800,10 @@ def handle_camera():
 
             # 3. GỬI 4 ROBOT QUA SERIAL -> ESP32
             # Giao thức Python -> ESP32 gateway:
-            #   ID;X.X;Y.Y;ANGLE.A#
-            # X, Y, ANGLE đều gửi dạng float với 1 chữ số thập phân.
+            #   ID;X.X;Y.Y;ANGLE_RAD#
+            # X, Y gửi 1 chữ số thập phân; ANGLE_RAD gửi 5 chữ số thập phân.
             # Ví dụ một nhịp có đủ 4 robot:
-            #   8;352.4;64.7;43.2#7;420.8;80.1;271.6#3;500.2;40.0;90.0#29;510.0;60.0;180.0#
+            #   8;352.4;64.7;0.75400#7;420.8;80.1;-1.54300#3;500.2;40.0;1.57080#29;510.0;60.0;3.14159#
             # ESP32 gateway chỉ cần tách từng packet theo dấu '#', đọc ID đầu tiên
             # rồi route packet đến đúng robot.
             # ---------------- Robot 1 ----------------
@@ -2561,7 +2811,7 @@ def handle_camera():
                 x_send = round(float(robot_filtered_position[0]), 1)
                 y_send = round(float(robot_filtered_position[1]), 1)
                 angle_send = (
-                    round(float(robot_filtered_angle), 1)
+                    float(robot_filtered_angle)
                     if robot_filtered_angle is not None else 0.0
                 )
 
@@ -2571,7 +2821,7 @@ def handle_camera():
 
                 _set_latest_robot_packet(
                     robot_id,
-                    f"{robot_id};{x_send:.1f};{y_send:.1f};{angle_send:.1f}#"
+                    f"{robot_id};{x_send:.1f};{y_send:.1f};{angle_send:.5f}#"
                 )
             else:
                 with latest_xy_lock:
@@ -2584,7 +2834,7 @@ def handle_camera():
                 x2_send = round(float(robot2_filtered_position[0]), 1)
                 y2_send = round(float(robot2_filtered_position[1]), 1)
                 angle2_send = (
-                    round(float(robot2_filtered_angle), 1)
+                    float(robot2_filtered_angle)
                     if robot2_filtered_angle is not None else 0.0
                 )
 
@@ -2594,7 +2844,7 @@ def handle_camera():
 
                 _set_latest_robot_packet(
                     robot2_id,
-                    f"{robot2_id};{x2_send:.1f};{y2_send:.1f};{angle2_send:.1f}#"
+                    f"{robot2_id};{x2_send:.1f};{y2_send:.1f};{angle2_send:.5f}#"
                 )
             else:
                 with latest_xy_lock:
@@ -2607,7 +2857,7 @@ def handle_camera():
                 x3_send = round(float(robot3_filtered_position[0]), 1)
                 y3_send = round(float(robot3_filtered_position[1]), 1)
                 angle3_send = (
-                    round(float(robot3_filtered_angle), 1)
+                    float(robot3_filtered_angle)
                     if robot3_filtered_angle is not None else 0.0
                 )
 
@@ -2617,7 +2867,7 @@ def handle_camera():
 
                 _set_latest_robot_packet(
                     robot3_id,
-                    f"{robot3_id};{x3_send:.1f};{y3_send:.1f};{angle3_send:.1f}#"
+                    f"{robot3_id};{x3_send:.1f};{y3_send:.1f};{angle3_send:.5f}#"
                 )
             else:
                 with latest_xy_lock:
@@ -2630,7 +2880,7 @@ def handle_camera():
                 x4_send = round(float(robot4_filtered_position[0]), 1)
                 y4_send = round(float(robot4_filtered_position[1]), 1)
                 angle4_send = (
-                    round(float(robot4_filtered_angle), 1)
+                    float(robot4_filtered_angle)
                     if robot4_filtered_angle is not None else 0.0
                 )
 
@@ -2640,7 +2890,7 @@ def handle_camera():
 
                 _set_latest_robot_packet(
                     robot4_id,
-                    f"{robot4_id};{x4_send:.1f};{y4_send:.1f};{angle4_send:.1f}#"
+                    f"{robot4_id};{x4_send:.1f};{y4_send:.1f};{angle4_send:.5f}#"
                 )
             else:
                 with latest_xy_lock:
@@ -2731,7 +2981,7 @@ def handle_camera():
 
                     cv2.circle(background, (draw_x, draw_y), 7, (48, 79, 220), -1, cv2.LINE_AA)
                     robot1_angle_text = (
-                        f" A={real_angle_map[robot_id]:.1f}"
+                        f" A={real_angle_map[robot_id]:.5f} rad"
                         if robot_id in real_angle_map else ''
                     )
                     cv2.putText(background,
@@ -2782,7 +3032,7 @@ def handle_camera():
                     robot2_color = (220, 150, 35)
                     cv2.circle(background, (draw_x, draw_y), 7, robot2_color, -1, cv2.LINE_AA)
                     robot2_angle_text = (
-                        f" A={real_angle_map[robot2_id]:.1f}"
+                        f" A={real_angle_map[robot2_id]:.5f} rad"
                         if robot2_id in real_angle_map else ''
                     )
                     cv2.putText(background,
@@ -2831,7 +3081,7 @@ def handle_camera():
                     robot3_color = (160, 70, 210)
                     cv2.circle(background, (draw_x, draw_y), 7, robot3_color, -1, cv2.LINE_AA)
                     robot3_angle_text = (
-                        f" A={real_angle_map[robot3_id]:.1f}"
+                        f" A={real_angle_map[robot3_id]:.5f} rad"
                         if robot3_id in real_angle_map else ''
                     )
                     cv2.putText(
@@ -2887,7 +3137,7 @@ def handle_camera():
                     robot4_color = (80, 180, 180)
                     cv2.circle(background, (draw_x, draw_y), 7, robot4_color, -1, cv2.LINE_AA)
                     robot4_angle_text = (
-                        f" A={real_angle_map[robot4_id]:.1f}"
+                        f" A={real_angle_map[robot4_id]:.5f} rad"
                         if robot4_id in real_angle_map else ''
                     )
                     cv2.putText(
@@ -2919,7 +3169,7 @@ def handle_camera():
                         marker_text = (
                             f"[{key}] "
                             f"({int(real_x)}, {int(real_y)}) "
-                            f"A={marker_angle:.1f}"
+                            f"A={marker_angle:.5f} rad"
                         )
 
                     else:
@@ -3091,7 +3341,7 @@ def handle_camera():
                         cv2.FONT_HERSHEY_DUPLEX, 0.93, TEXT_MAIN, 1, cv2.LINE_AA)
             cv2.putText(dashboard, 'SMART CONTROL DASHBOARD', (24, 67),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.50, TEXT_MUTED, 1, cv2.LINE_AA)
-            cv2.putText(dashboard, 'C  CLEAR PATH      E  CALIB CAM2      Q  QUIT',
+            cv2.putText(dashboard, 'C  CLEAR PATH      E  CALIB CAM2 UNDIST      Q  QUIT',
                         (365, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.48,
                         TEXT_MUTED, 1, cv2.LINE_AA)
             cv2.putText(dashboard, f'{current_date}    {current_clock}',
@@ -3267,20 +3517,20 @@ def handle_camera():
             # SIDE PANEL - 4 ROBOT
 
             # ---------- SYSTEM STATUS ----------
-            status_rect = (SIDE_X + 14, SIDE_Y + 14, SIDE_X + 376, SIDE_Y + 126)
+            status_rect = (SIDE_X + 14, SIDE_Y + 14, SIDE_X + 376, SIDE_Y + 112)
             _draw_round_rect(dashboard, status_rect, CARD_BG, 14, border=CARD_EDGE)
 
-            cv2.putText(dashboard, 'SYSTEM STATUS', (SIDE_X + 28, SIDE_Y + 40),
+            cv2.putText(dashboard, 'SYSTEM STATUS', (SIDE_X + 28, SIDE_Y + 36),
                         cv2.FONT_HERSHEY_DUPLEX, 0.52, TEXT_MAIN, 1, cv2.LINE_AA)
-            _draw_status_dot(dashboard, (SIDE_X + 345, SIDE_Y + 34),
+            _draw_status_dot(dashboard, (SIDE_X + 345, SIDE_Y + 31),
                              GREEN if connected else RED)
 
-            cv2.putText(dashboard, 'ESP32', (SIDE_X + 28, SIDE_Y + 66),
+            cv2.putText(dashboard, 'ESP32', (SIDE_X + 28, SIDE_Y + 60),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.36, TEXT_SOFT, 1, cv2.LINE_AA)
-            _put_fit_text(dashboard, conn_text, (SIDE_X + 100, SIDE_Y + 66), 240,
+            _put_fit_text(dashboard, conn_text, (SIDE_X + 100, SIDE_Y + 60), 240,
                           cv2.FONT_HERSHEY_SIMPLEX, 0.39, conn_color, 1)
 
-            cv2.putText(dashboard, 'SEND', (SIDE_X + 28, SIDE_Y + 92),
+            cv2.putText(dashboard, 'SEND', (SIDE_X + 28, SIDE_Y + 82),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.36, TEXT_SOFT, 1, cv2.LINE_AA)
             send_status = (
                 f'R8:{"ON" if r8_send_on else "OFF"}   '
@@ -3288,46 +3538,46 @@ def handle_camera():
                 f'R3:{"ON" if r3_send_on else "OFF"}   '
                 f'R29:{"ON" if r29_send_on else "OFF"}'
             )
-            _put_fit_text(dashboard, send_status, (SIDE_X + 82, SIDE_Y + 92), 270,
+            _put_fit_text(dashboard, send_status, (SIDE_X + 82, SIDE_Y + 82), 270,
                           cv2.FONT_HERSHEY_SIMPLEX, 0.35,
                           GREEN if (r8_send_on or r7_send_on or r3_send_on or r29_send_on) else TEXT_MUTED, 1)
 
-            cv2.putText(dashboard, 'FPS', (SIDE_X + 28, SIDE_Y + 116),
+            cv2.putText(dashboard, 'FPS', (SIDE_X + 28, SIDE_Y + 104),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.34, TEXT_SOFT, 1, cv2.LINE_AA)
-            cv2.putText(dashboard, f'{fps:4.1f}', (SIDE_X + 100, SIDE_Y + 116),
+            cv2.putText(dashboard, f'{fps:4.1f}', (SIDE_X + 100, SIDE_Y + 104),
                         cv2.FONT_HERSHEY_DUPLEX, 0.40, CYAN, 1, cv2.LINE_AA)
 
             # ---------- ROBOTS POSITION ----------
-            pos_rect = (SIDE_X + 14, SIDE_Y + 136, SIDE_X + 376, SIDE_Y + 268)
+            pos_rect = (SIDE_X + 14, SIDE_Y + 120, SIDE_X + 376, SIDE_Y + 250)
             _draw_round_rect(dashboard, pos_rect, CARD_BG_ALT, 14, border=CARD_EDGE)
-            cv2.putText(dashboard, 'ROBOTS POSITION', (SIDE_X + 28, SIDE_Y + 159),
+            cv2.putText(dashboard, 'ROBOTS POSITION', (SIDE_X + 28, SIDE_Y + 142),
                         cv2.FONT_HERSHEY_DUPLEX, 0.42, TEXT_MAIN, 1, cv2.LINE_AA)
 
             r1_x = '--' if ui_x is None else f'{ui_x:.1f}'
             r1_y = '--' if ui_y is None else f'{ui_y:.1f}'
-            r1_a = '--' if robot_filtered_angle is None else f'{robot_filtered_angle:.1f}'
+            r1_a = '--' if robot_filtered_angle is None else f'{robot_filtered_angle:.5f}'
             r2_x = '--' if ui_x2 is None else f'{ui_x2:.1f}'
             r2_y = '--' if ui_y2 is None else f'{ui_y2:.1f}'
-            r2_a = '--' if robot2_filtered_angle is None else f'{robot2_filtered_angle:.1f}'
+            r2_a = '--' if robot2_filtered_angle is None else f'{robot2_filtered_angle:.5f}'
             r3_x = '--' if ui_x3 is None else f'{ui_x3:.1f}'
             r3_y = '--' if ui_y3 is None else f'{ui_y3:.1f}'
-            r3_a = '--' if robot3_filtered_angle is None else f'{robot3_filtered_angle:.1f}'
+            r3_a = '--' if robot3_filtered_angle is None else f'{robot3_filtered_angle:.5f}'
             r4_x = '--' if ui_x4 is None else f'{ui_x4:.1f}'
             r4_y = '--' if ui_y4 is None else f'{ui_y4:.1f}'
-            r4_a = '--' if robot4_filtered_angle is None else f'{robot4_filtered_angle:.1f}'
+            r4_a = '--' if robot4_filtered_angle is None else f'{robot4_filtered_angle:.5f}'
 
             robot_rows = [
-                (robot_id, r1_x, r1_y, r1_a, GREEN, SIDE_Y + 184),
-                (robot2_id, r2_x, r2_y, r2_a, CYAN, SIDE_Y + 209),
-                (robot3_id, r3_x, r3_y, r3_a, (200, 120, 230), SIDE_Y + 234),
-                (robot4_id, r4_x, r4_y, r4_a, (80, 180, 180), SIDE_Y + 259),
+                (robot_id, r1_x, r1_y, r1_a, GREEN, SIDE_Y + 168),
+                (robot2_id, r2_x, r2_y, r2_a, CYAN, SIDE_Y + 192),
+                (robot3_id, r3_x, r3_y, r3_a, (200, 120, 230), SIDE_Y + 216),
+                (robot4_id, r4_x, r4_y, r4_a, (80, 180, 180), SIDE_Y + 240),
             ]
             for rid, xx, yy, aa, color, row_y in robot_rows:
                 cv2.putText(dashboard, f'R{rid}', (SIDE_X + 28, row_y),
                             cv2.FONT_HERSHEY_DUPLEX, 0.40, color, 1, cv2.LINE_AA)
                 _put_fit_text(
                     dashboard,
-                    f'X {xx}   Y {yy}   A {aa} deg',
+                    f'X {xx}   Y {yy}   A {aa} rad',
                     (SIDE_X + 70, row_y),
                     282,
                     cv2.FONT_HERSHEY_SIMPLEX,
@@ -3364,18 +3614,18 @@ def handle_camera():
             _draw_button(R29_CLEAR_BUTTON, f'R{robot4_id} CLR PATH', SLATE)
 
             # ---------- RUN METRICS ----------
-            metrics_rect = (SIDE_X + 14, SIDE_Y + 464, SIDE_X + 376, SIDE_Y + 616)
+            metrics_rect = (SIDE_X + 14, SIDE_Y + 414, SIDE_X + 376, SIDE_Y + 542)
             _draw_round_rect(dashboard, metrics_rect, CARD_BG, 14, border=CARD_EDGE)
-            cv2.putText(dashboard, 'RUN METRICS', (SIDE_X + 28, SIDE_Y + 487),
+            cv2.putText(dashboard, 'RUN METRICS', (SIDE_X + 28, SIDE_Y + 437),
                         cv2.FONT_HERSHEY_DUPLEX, 0.42, TEXT_MAIN, 1, cv2.LINE_AA)
 
-            cv2.putText(dashboard, 'ROBOT', (SIDE_X + 28, SIDE_Y + 509),
+            cv2.putText(dashboard, 'ROBOT', (SIDE_X + 28, SIDE_Y + 458),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.27, TEXT_SOFT, 1, cv2.LINE_AA)
-            cv2.putText(dashboard, 'DIST', (SIDE_X + 90, SIDE_Y + 509),
+            cv2.putText(dashboard, 'DIST', (SIDE_X + 90, SIDE_Y + 458),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.27, TEXT_SOFT, 1, cv2.LINE_AA)
-            cv2.putText(dashboard, 'SPEED', (SIDE_X + 180, SIDE_Y + 509),
+            cv2.putText(dashboard, 'SPEED', (SIDE_X + 180, SIDE_Y + 458),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.27, TEXT_SOFT, 1, cv2.LINE_AA)
-            cv2.putText(dashboard, 'TIME', (SIDE_X + 292, SIDE_Y + 509),
+            cv2.putText(dashboard, 'TIME', (SIDE_X + 292, SIDE_Y + 458),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.27, TEXT_SOFT, 1, cv2.LINE_AA)
 
             def _format_distance(dist_cm):
@@ -3389,16 +3639,16 @@ def handle_camera():
             metrics_rows = [
                 (robot_id, GREEN, robot_total_distance_cm,
                  _metric_speed(robot_speed_cm_s, robot_last_motion_time),
-                 get_robot_run_seconds(robot_id), SIDE_Y + 534),
+                 get_robot_run_seconds(robot_id), SIDE_Y + 482),
                 (robot2_id, CYAN, robot2_total_distance_cm,
                  _metric_speed(robot2_speed_cm_s, robot2_last_motion_time),
-                 get_robot_run_seconds(robot2_id), SIDE_Y + 558),
+                 get_robot_run_seconds(robot2_id), SIDE_Y + 501),
                 (robot3_id, (200, 120, 230), robot3_total_distance_cm,
                  _metric_speed(robot3_speed_cm_s, robot3_last_motion_time),
-                 get_robot_run_seconds(robot3_id), SIDE_Y + 582),
+                 get_robot_run_seconds(robot3_id), SIDE_Y + 520),
                 (robot4_id, (80, 180, 180), robot4_total_distance_cm,
                  _metric_speed(robot4_speed_cm_s, robot4_last_motion_time),
-                 get_robot_run_seconds(robot4_id), SIDE_Y + 606),
+                 get_robot_run_seconds(robot4_id), SIDE_Y + 539),
             ]
 
             for rid, color, dist_value, speed_value, run_sec, row_y in metrics_rows:
@@ -3415,14 +3665,14 @@ def handle_camera():
                               cv2.FONT_HERSHEY_DUPLEX, 0.31, TEXT_MAIN, 1)
 
             # ---------- EVENT LOG ----------
-            log_rect = (SIDE_X + 14, SIDE_Y + 626, SIDE_X + 376, SIDE_Y + 696)
+            log_rect = (SIDE_X + 14, SIDE_Y + 550, SIDE_X + 376, SIDE_Y + 618)
             _draw_round_rect(dashboard, log_rect, CARD_BG, 14, border=CARD_EDGE)
-            cv2.putText(dashboard, 'EVENT LOG', (SIDE_X + 28, SIDE_Y + 649),
+            cv2.putText(dashboard, 'EVENT LOG', (SIDE_X + 28, SIDE_Y + 572),
                         cv2.FONT_HERSHEY_DUPLEX, 0.40, TEXT_MAIN, 1, cv2.LINE_AA)
 
             recent_events = event_log[-2:]
             for row_idx, (stamp, message, event_color) in enumerate(recent_events):
-                yy = SIDE_Y + 672 + row_idx * 18
+                yy = SIDE_Y + 594 + row_idx * 17
                 cv2.putText(dashboard, stamp, (SIDE_X + 28, yy),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.30, TEXT_SOFT, 1, cv2.LINE_AA)
                 _put_fit_text(dashboard, message, (SIDE_X + 95, yy), 250,
@@ -3431,9 +3681,9 @@ def handle_camera():
             # ---------- TARGET WAYPOINTS ----------
             target_card = (
                 SIDE_X + 14,
-                SIDE_Y + 706,
+                SIDE_Y + 626,
                 SIDE_X + 376,
-                SIDE_Y + 860
+                SIDE_Y + 758
             )
             _draw_round_rect(
                 dashboard,
@@ -3448,8 +3698,8 @@ def handle_camera():
 
             cv2.putText(
                 dashboard,
-                'TARGET POINTS - 1 PACKET',
-                (SIDE_X + 28, SIDE_Y + 728),
+                f'TARGET POINTS - R{selected_target_robot}: {len(selected_points)}',
+                (SIDE_X + 28, SIDE_Y + 648),
                 cv2.FONT_HERSHEY_DUPLEX,
                 0.40,
                 TEXT_MAIN,
@@ -3504,22 +3754,6 @@ def handle_camera():
                 'CLEAR TARGET',
                 RED,
                 False
-            )
-
-            waypoint_status = (
-                f'R{selected_target_robot}: {len(selected_points)} points'
-                '   |   Left click map to add'
-            )
-
-            _put_fit_text(
-                dashboard,
-                waypoint_status,
-                (SIDE_X + 28, SIDE_Y + 850),
-                330,
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.32,
-                TEXT_SOFT,
-                1
             )
 
             # ---------- CAMERA VIEW BUTTONS ----------
@@ -3666,6 +3900,12 @@ def handle_camera():
         key_press = cv2.waitKey(1) & 0xFF
         action = ui_state.get('action')
         ui_state['action'] = None
+
+        # Phím E là lệnh calibration ưu tiên tuyệt đối. Nếu cùng frame có
+        # mouse action cũ (đặc biệt CLEAR R8), bỏ action đó để E không bị nuốt.
+        if key_press in (ord('e'), ord('E')):
+            action = None
+            ui_state['action'] = None
 
         # PHÍM ZOOM MAP
         if key_press in (ord('+'), ord('=')):
@@ -3930,92 +4170,215 @@ def handle_camera():
                 f"| R29 SEND={'ON' if send_robot29_enabled.is_set() else 'OFF'}"
             )
 
-        # E: CALIB CAM2
+        # E: CALIB CAM2 (UNDISTORTED, 60-FRAME MEDIAN, FULL ARUCO CORNERS)
         elif key_press in (ord('e'), ord('E')):
-            pts_pixel_cam2 = []
-            pts_real = []
-            used_marker_ids = set()
-            common_count = 0
+            # Khóa mouse action trong suốt thời gian lấy 60 frame.
+            ui_state['calibrating_h2'] = True
+            ui_state['action'] = None
+            samples = {}
 
-            # Chỉ sử dụng marker cùng xuất hiện trong cả Camera 1 và Camera 2.
-            # Mỗi marker đóng góp đúng một cặp điểm: tâm pixel Camera 2
-            # ↔ tọa độ thực của tâm marker suy ra từ Camera 1.
-            if ids is not None and ids2 is not None:
-                ids1_flat = ids.flatten().tolist()
-                ids2_flat = ids2.flatten().tolist()
+            # Thu 60 cặp frame nhưng không render/progress để không tăng tải GUI.
+            # Mỗi sample giữ nguyên cả 4 corner của cùng một marker ở cả hai camera.
+            for _ in range(H2_CALIB_COLLECT_FRAMES):
+                ok_cal1, frame_cal1 = cam_stream.read()
+                ok_cal2, frame_cal2 = cam_stream2.read()
 
-                for markerCorner2, markerID in zip(corners2, ids2_flat):
-                    # Không dùng marker robot làm điểm calibration.
-                    if markerID in ROBOT_IDS:
+                if (
+                    not ok_cal1 or not ok_cal2
+                    or frame_cal1 is None or frame_cal2 is None
+                    or frame_cal1.size == 0 or frame_cal2.size == 0
+                ):
+                    time.sleep(H2_CALIB_FRAME_INTERVAL_SEC)
+                    continue
+
+                gray_cal1 = cv2.cvtColor(frame_cal1, cv2.COLOR_BGR2GRAY)
+                gray_cal2 = cv2.cvtColor(frame_cal2, cv2.COLOR_BGR2GRAY)
+
+                future_cal1 = aruco_detect_pool.submit(
+                    cv2.aruco.detectMarkers,
+                    gray_cal1,
+                    arucoDict,
+                    parameters=arucoParams
+                )
+                future_cal2 = aruco_detect_pool.submit(
+                    cv2.aruco.detectMarkers,
+                    gray_cal2,
+                    arucoDict,
+                    parameters=arucoParamsCam2
+                )
+
+                corners_cal1, ids_cal1, _ = future_cal1.result()
+                corners_cal2, ids_cal2, _ = future_cal2.result()
+
+                if ids_cal1 is None or ids_cal2 is None:
+                    time.sleep(H2_CALIB_FRAME_INTERVAL_SEC)
+                    continue
+
+                ids1_flat = ids_cal1.flatten().tolist()
+                ids2_flat = ids_cal2.flatten().tolist()
+                common_ids = set(ids1_flat) & set(ids2_flat)
+
+                for marker_id in common_ids:
+                    # 4 robot không dùng làm mốc H2 trong vận hành.
+                    if marker_id in ROBOT_IDS:
                         continue
-                    if markerID not in ids1_flat or markerID in used_marker_ids:
-                        continue
 
-                    center2 = get_marker_center(markerCorner2)
-                    idx1 = ids1_flat.index(markerID)
-                    center1 = get_marker_center(corners[idx1])
-                    if center1 is None or center2 is None:
-                        continue
+                    idx1 = ids1_flat.index(marker_id)
+                    idx2 = ids2_flat.index(marker_id)
 
-                    cx2, cy2 = center2
-                    cx1, cy1 = center1
-
-                    real_pt = transform_point_with_homography(
-                        (cx1, cy1), matrix_cam1_to_real
+                    corner1 = np.asarray(
+                        corners_cal1[idx1], dtype=np.float64
+                    ).reshape(4, 2)
+                    corner2_und = undistort_marker_corners(
+                        corners_cal2[idx2], K2, D2, newK2
                     )
-                    if real_pt is None:
+                    if corner2_und is None:
+                        continue
+                    corner2_und = np.asarray(corner2_und, dtype=np.float64).reshape(4, 2)
+
+                    if (
+                        not np.all(np.isfinite(corner1))
+                        or not np.all(np.isfinite(corner2_und))
+                    ):
                         continue
 
-                    pts_pixel_cam2.append([cx2, cy2])
-                    pts_real.append(list(real_pt))
-                    used_marker_ids.add(markerID)
-                    common_count += 1
+                    marker_samples = samples.setdefault(
+                        int(marker_id),
+                        {'cam1_corners': [], 'cam2_corners': []}
+                    )
+                    # Hai mảng được append cùng lúc nên luôn giữ correspondence theo frame.
+                    marker_samples['cam1_corners'].append(corner1)
+                    marker_samples['cam2_corners'].append(corner2_und)
 
-            _debug_print(
-                f">>> Tổng điểm hiệu chỉnh từ marker chung: "
-                f"{common_count}"
+                time.sleep(H2_CALIB_FRAME_INTERVAL_SEC)
+
+            valid_ids = sorted(
+                marker_id
+                for marker_id, data in samples.items()
+                if min(
+                    len(data['cam1_corners']),
+                    len(data['cam2_corners'])
+                ) >= H2_CALIB_MIN_VALID_SAMPLES
             )
 
-            if len(pts_pixel_cam2) < 4:
-                _add_event(f'Calib failed: {len(pts_pixel_cam2)} common markers', RED)
-                _debug_print(
-                    f">>> TỪ CHỐI: Chỉ có {len(pts_pixel_cam2)} marker chung; "
-                    f"cần ít nhất 4 marker chung ở các vị trí phân bố rộng."
+            # Vẫn yêu cầu tối thiểu 4 MARKER chung để vùng ghép đủ rộng.
+            # Mỗi marker đóng góp 4 corner => 4/5/6 marker = 16/20/24 correspondence.
+            if len(valid_ids) < 4:
+                _add_event(
+                    f'Calib failed: {len(valid_ids)} valid markers',
+                    RED
                 )
+                _calib_print(
+                    "\n========== CALIB H2 FULL-CORNER =========="
+                )
+                _calib_print(
+                    f"FAILED: chỉ có {len(valid_ids)} marker đủ "
+                    f">= {H2_CALIB_MIN_VALID_SAMPLES}/"
+                    f"{H2_CALIB_COLLECT_FRAMES} mẫu."
+                )
+                _calib_print("===========================================\n")
             else:
-                pts_src = np.asarray(pts_pixel_cam2, dtype=np.float64)
-                pts_dst = np.asarray(pts_real, dtype=np.float64)
+                pts_cam2_und = []
+                pts_cam1_raw = []
 
-                H_candidate, mask, metrics, reason = estimate_homography_checked(
-                    pts_src, pts_dst
+                for marker_id in valid_ids:
+                    cam1_samples = np.asarray(
+                        samples[marker_id]['cam1_corners'], dtype=np.float64
+                    )
+                    cam2_samples = np.asarray(
+                        samples[marker_id]['cam2_corners'], dtype=np.float64
+                    )
+
+                    # Median THEO TỪNG CORNER qua 60 frame, không dùng center nữa.
+                    # Shape sau median: (4, 2), giữ đúng thứ tự corner ArUco.
+                    corners1_median = np.median(cam1_samples, axis=0)
+                    corners2_median = np.median(cam2_samples, axis=0)
+
+                    pts_cam1_raw.extend(corners1_median.tolist())
+                    pts_cam2_und.extend(corners2_median.tolist())
+
+                pts_src = np.asarray(pts_cam2_und, dtype=np.float64)
+                pts_dst = np.asarray(pts_cam1_raw, dtype=np.float64)
+
+                H_candidate, mask, metrics, reason = estimate_intercamera_homography_checked(
+                    pts_src,
+                    pts_dst,
+                    matrix_cam1_to_real
                 )
 
                 if H_candidate is None:
-                    _add_event('Calib Cam2 rejected', RED)
-                    _debug_print(f">>> TỪ CHỐI HOMOGRAPHY: {reason}")
+                    # Hiện chẩn đoán trực tiếp trên 2 dòng Event Log, không chỉ console.
                     if metrics:
-                        _debug_print(f">>> Chẩn đoán: {metrics}")
+                        inliers = metrics.get('inliers', 0)
+                        total = metrics.get('total', len(pts_src))
+                        _add_event(
+                            f'H2 FAIL {inliers}/{total}C inlier',
+                            RED
+                        )
+
+                        px_rmse = metrics.get('pixel_rmse_px')
+                        cm_rmse = metrics.get('world_rmse_cm')
+                        if px_rmse is not None or cm_rmse is not None:
+                            px_text = '--' if px_rmse is None else f'{px_rmse:.2f}px'
+                            cm_text = '--' if cm_rmse is None else f'{cm_rmse:.2f}cm'
+                            _add_event(
+                                f'RMSE px={px_text} world={cm_text}',
+                                RED
+                            )
+                        else:
+                            _add_event('Calib Cam2 rejected', RED)
+                    else:
+                        _add_event('Calib Cam2 rejected', RED)
+
+                    _calib_print("\n========== CALIB H2 FULL-CORNER ==========")
+                    _calib_print(f"STATUS      : FAILED")
+                    _calib_print(f"MARKERS     : {len(valid_ids)} -> {valid_ids}")
+                    _calib_print(f"REASON      : {reason}")
+                    if metrics:
+                        _calib_print(
+                            f"INLIERS     : {metrics.get('inliers', 0)}/"
+                            f"{metrics.get('total', len(pts_src))} corners"
+                        )
+                        px_rmse = metrics.get('pixel_rmse_px')
+                        cm_rmse = metrics.get('world_rmse_cm')
+                        if px_rmse is not None:
+                            _calib_print(f"PIXEL RMSE  : {px_rmse:.4f} px")
+                        if cm_rmse is not None:
+                            _calib_print(f"WORLD RMSE  : {cm_rmse:.4f} cm")
+                    _calib_print("===========================================\n")
                 else:
-                    # Chỉ cập nhật khi H mới vượt qua toàn bộ kiểm tra.
                     matrix_cam2_to_real = H_candidate
 
                     os.makedirs(os.path.dirname(HOMOGRAPHY_CAM2_FILE), exist_ok=True)
                     with open(HOMOGRAPHY_CAM2_FILE, 'wb') as f:
                         pickle.dump(matrix_cam2_to_real, f)
 
-                    gap_text = ('∞' if np.isinf(metrics['singular_gap'])
-                                else f"{metrics['singular_gap']:.2f}")
-                    _debug_print(
-                        f">>> HOMOGRAPHY ĐƯỢC CHẤP NHẬN: "
-                        f"{metrics['inliers']}/{metrics['total']} inliers, "
-                        f"RMSE={metrics['rmse_cm']:.2f} cm, "
-                        f"max={metrics['max_error_cm']:.2f} cm, "
-                        f"rank(A)={metrics['rank_A']}, gap SVD={gap_text}."
+                    _calib_print("\n========== CALIB H2 FULL-CORNER ==========")
+                    _calib_print(f"STATUS      : OK")
+                    _calib_print(f"MARKERS     : {len(valid_ids)} -> {valid_ids}")
+                    _calib_print(f"CORNERS     : {metrics['total']}")
+                    _calib_print(
+                        f"INLIERS     : {metrics['inliers']}/{metrics['total']} "
+                        f"({100.0 * metrics['inliers'] / max(metrics['total'], 1):.1f}%)"
+                    )
+                    _calib_print(f"PIXEL RMSE  : {metrics['pixel_rmse_px']:.4f} px")
+                    _calib_print(f"WORLD RMSE  : {metrics['world_rmse_cm']:.4f} cm")
+                    # Event Log chỉ có 2 dòng hiển thị, nên dành trọn 2 dòng
+                    # cho kết quả calibration: inlier và cả pixel/world RMSE.
+                    _add_event(
+                        f"H2 OK {len(valid_ids)}M {metrics['inliers']}/{metrics['total']}C",
+                        GREEN
                     )
                     _add_event(
-                        f"Calib OK: RMSE {metrics['rmse_cm']:.2f} cm", GREEN
+                        f"RMSE {metrics['pixel_rmse_px']:.2f}px | {metrics['world_rmse_cm']:.2f}cm",
+                        GREEN
                     )
-                    _debug_print(f">>> Đã lưu tại '{HOMOGRAPHY_CAM2_FILE}'")
+                    _calib_print(f"SAVED       : {HOMOGRAPHY_CAM2_FILE}")
+                    _calib_print("===========================================\n")
+
+            # Xóa mọi mouse action phát sinh trong lúc calibration và mở lại UI.
+            ui_state['action'] = None
+            ui_state['calibrating_h2'] = False
         # Q hoặc đóng cửa sổ để thoát.
         elif key_press in (ord('q'), ord('Q')):
             break
