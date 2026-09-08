@@ -1,150 +1,166 @@
-# 3-Robot ArUco Tracking & Waypoint Control
+# 4-Robot ArUco Tracking & Serial Control
 
-Hệ thống theo dõi **3 robot bằng 2 camera**, sử dụng **ArUco + Homography**, hiển thị vị trí/góc/quỹ đạo trên dashboard OpenCV và truyền dữ liệu tới **ESP32 Gateway** qua Serial.
+Hệ thống này dùng 2 camera USB để theo dõi 4 robot gắn marker ArUco, tính vị trí `X, Y` theo cm và góc hướng theo radian, hiển thị trên dashboard OpenCV, rồi gửi dữ liệu tới ESP32 Gateway qua Serial. ESP32 Gateway route packet tới từng robot bằng ESP-NOW.
 
-## 1. Robot hiện tại
+## 1. Trạng thái hiện tại
 
-- Robot 1: ArUco ID **8**
-- Robot 2: ArUco ID **7**
-- Robot 3: ArUco ID **3**
-- ArUco dictionary: `DICT_4X4_100`
+Code hiện tại đang theo dõi 4 robot:
 
-> Nếu repository dùng bản `easy-change-ID`, nên gom ID về một khu vực cấu hình duy nhất để người dùng chỉ sửa một số khi đổi marker.
+| Robot | ArUco ID | Ghi chú |
+|---|---:|---|
+| Robot 1 | `8` | Có START / STOP / CLEAR PATH / TARGET |
+| Robot 2 | `7` | Có START / STOP / CLEAR PATH / TARGET |
+| Robot 3 | `3` | Có START / STOP / CLEAR PATH / TARGET |
+| Robot 4 | `29` | Có START / STOP / CLEAR PATH / TARGET |
 
----
+Thông số chính trong `realtime_aruco_detect.py`:
 
-## 2. Kiến trúc hệ thống
+| Thông số | Giá trị hiện tại |
+|---|---|
+| ArUco dictionary | `DICT_4X4_100` |
+| Camera 1 | index `0` |
+| Camera 2 | index `2` |
+| Camera resolution | `640 x 480` |
+| Serial port | `COM19` |
+| Serial baud rate | `115200` |
+| Serial transmit rate | `30 Hz` |
+| Map width | `540 cm` |
+| Map height | `120 cm` |
+| Max waypoint mỗi robot | `50` |
+| Giới hạn payload waypoint | `240 bytes` |
+
+## 2. Kiến trúc
 
 ```text
 Camera 1 ─┐
           ├──> Python + OpenCV
 Camera 2 ─┘        │
-                   │ ArUco + Homography
-                   │ X, Y, Angle
+                   │ Detect ArUco
+                   │ Homography
+                   │ X, Y, Angle(rad)
                    ▼
-                USB Serial
+              USB Serial
                    │
                    ▼
              ESP32 Gateway
                    │
                 ESP-NOW
-          ┌────────┼────────┐
-          ▼        ▼        ▼
-       ESP32 R8 ESP32 R7 ESP32 R3
-          │        │        │
-         UART     UART     UART
-          │        │        │
-          ▼        ▼        ▼
-        Mega     Mega     Mega
+          ┌────────┼────────┬────────┐
+          ▼        ▼        ▼        ▼
+       Robot 8  Robot 7  Robot 3  Robot 29
 ```
 
----
+Gateway hiện chỉ làm nhiệm vụ tách `ID` đầu packet và gửi phần payload còn lại tới MAC của robot tương ứng.
 
-## 3. Chức năng chính
+Receiver ESP32 hiện đã nhận được `START#`, `STOP#`, `X;Y;ANGLE_RAD#` và in dữ liệu ra Serial. Phần thuật toán điều khiển motor cần được thêm tại comment trong file receiver.
 
-Chương trình Python hỗ trợ:
+## 3. Cấu trúc thư mục
 
-- Đọc đồng thời 2 camera USB.
-- Nhận dạng ArUco.
-- Tính tọa độ thực `X, Y` bằng Homography.
-- Tính góc robot trong hệ tọa độ thực.
-- Hợp nhất dữ liệu Camera 1 / Camera 2 trong vùng overlap.
-- Giữ camera đang active để hạn chế nhảy tọa độ.
-- Lọc vị trí bằng EMA.
-- Lọc góc và xử lý đúng trường hợp `359° -> 1°`.
-- Vẽ toàn bộ quỹ đạo robot.
-- Tính khoảng cách, tốc độ, thời gian chạy.
-- START / STOP / CLEAR PATH riêng cho từng robot.
-- Chấm nhiều điểm đích trực tiếp trên map.
-- Gửi danh sách waypoint trong **một packet**.
-- `CLEAR TARGET` độc lập với `CLEAR PATH`.
-- Camera preview chỉ mở khi người dùng bấm nút.
-- Luồng Serial chạy độc lập với FPS camera, mặc định khoảng `30 Hz`.
+```text
+aruco_python/
+├── realtime_aruco_detect.py              # Chương trình chính
+├── get_image.py                          # Chụp ảnh calib Camera 1
+├── get_image2.py                         # Chụp ảnh calib Camera 2
+├── calib_and_save_values.py              # Calib Camera 1 bằng bàn cờ
+├── calib_and_save_values2.py             # Calib Camera 2, có báo cáo lỗi
+├── test.py                               # A/B test Camera 2 RAW vs UNDISTORT
+├── send_data.py                          # Test gửi Serial giả lập
+├── calib_cam1/                           # Ảnh bàn cờ Camera 1
+├── calib_cam2/                           # Ảnh bàn cờ Camera 2
+├── calib_values/                         # Kết quả calib Camera 1
+├── calib_values2_new/                    # Kết quả calib Camera 2 đang dùng
+└── Ardunoide/
+    ├── ESP32gui/ESP32/ESP32.ino          # ESP32 Gateway
+    └── ESP32nhan/ESP8266/ESP8266.ino     # ESP32 Receiver
+```
 
----
+Tên thư mục `ESP8266` trong đường dẫn receiver chỉ là tên thư mục cũ. File bên trong đang dùng thư viện ESP32: `WiFi.h`, `esp_now.h`, `esp_wifi.h`.
 
-## 4. Yêu cầu phần mềm
+## 4. Cài đặt Python
 
-Khuyến nghị:
-
-- Python 3.10+
-- PyCharm hoặc VS Code
-- Arduino IDE 2.x
-
-Cài thư viện Python:
+Khuyến nghị dùng Python 3.10 trở lên.
 
 ```bash
 pip install numpy pyserial opencv-contrib-python
 ```
 
-Có thể tạo `requirements.txt`:
+Bắt buộc dùng `opencv-contrib-python` vì code dùng module:
 
-```text
-numpy
-pyserial
-opencv-contrib-python
+```python
+cv2.aruco
 ```
 
-Sau đó:
+Nếu bị lỗi không có `cv2.aruco`, cài lại:
 
 ```bash
-pip install -r requirements.txt
+pip uninstall opencv-python opencv-contrib-python -y
+pip install opencv-contrib-python
 ```
 
-> Phải dùng `opencv-contrib-python` vì chương trình sử dụng `cv2.aruco`.
+## 5. Chạy chương trình chính
 
----
+Kết nối đủ phần cứng:
 
-## 5. Cấu hình Serial
+```text
+Camera 1
+Camera 2
+ESP32 Gateway qua USB
+```
 
-Trong code hiện tại:
+Chạy từ đúng thư mục `aruco_python` để các đường dẫn calibration tương đối hoạt động đúng:
+
+```bash
+cd aruco_python
+python realtime_aruco_detect.py
+```
+
+Nếu ESP32 Gateway không nằm ở `COM19`, sửa trong `realtime_aruco_detect.py`:
 
 ```python
 com_port = 'COM19'
 baud_rate = 115200
 ```
 
-Nếu ESP32 Gateway ở COM khác, ví dụ COM8:
-
-```python
-com_port = 'COM8'
-```
-
-Baud rate trên Python và ESP32 Gateway phải giống nhau.
-
----
-
-## 6. Cấu hình Camera
-
-Trong code:
+Nếu camera không đúng index, sửa:
 
 ```python
 cam_stream = CameraStream(0).start()
 cam_stream2 = CameraStream(2).start()
 ```
 
-Tức là:
+## 6. Quy ước tọa độ và góc
+
+Tọa độ robot được gửi theo đơn vị cm:
 
 ```text
-Camera 1 = index 0
-Camera 2 = index 2
+X = vị trí theo trục Ox
+Y = vị trí theo trục Oy
 ```
 
-Nếu máy tính nhận camera khác index, hãy sửa số tương ứng.
+Góc robot được tính từ cạnh trên của marker ArUco, coi đó là hướng đầu robot.
 
-Camera đang dùng:
+Góc hiện tại dùng radian trong khoảng `[-pi, pi]`:
 
 ```text
-Resolution: 640 x 480
-FOURCC: MJPG
-Buffer: 1 frame
+0 rad       = +X
+pi / 2 rad  = +Y
+pi rad      = -X
+-pi / 2 rad = -Y
 ```
 
----
+Góc được gửi với 5 số sau dấu phẩy.
 
-## 7. Homography Camera 1
+Ví dụ:
 
-Camera 1 sử dụng 4 điểm pixel cố định:
+```text
+1.57080 rad = 90 độ
+3.14159 rad = 180 độ
+-1.57080 rad = -90 độ
+```
+
+## 7. Homography và calibration
+
+Camera 1 đang dùng 4 điểm pixel cố định trong code để tạo Homography:
 
 ```python
 img_points = np.array([
@@ -155,7 +171,7 @@ img_points = np.array([
 ], dtype=np.float32)
 ```
 
-Tương ứng tọa độ thực:
+Các điểm này ánh xạ sang vùng thật:
 
 ```python
 real_points = np.array([
@@ -166,665 +182,434 @@ real_points = np.array([
 ], dtype=np.float32)
 ```
 
-Homography được tính bằng:
-
-```python
-matrix_cam1_to_real = cv2.getPerspectiveTransform(
-    img_points,
-    real_points
-)
-```
-
-Nếu thay đổi vị trí camera, độ phân giải hoặc vùng làm việc thì nên hiệu chuẩn lại.
-
----
-
-## 8. Homography Camera 2
-
-File Homography Camera 2:
+Camera 2 dùng calibration và Homography đã lưu ở:
 
 ```text
-calib_values2/homography_cam2_to_real.pkl
+calib_values2_new/k_matrix.pkl
+calib_values2_new/dist_coef.pkl
+calib_values2_new/p_matrix.pkl
+calib_values2_new/homography_cam2_to_real_fullcorners.pkl
 ```
 
-Khi chạy, chương trình tự nạp file nếu tồn tại.
-
-Để hiệu chuẩn Camera 2, nhấn:
+Khi chạy chương trình chính, nếu file Homography Camera 2 tồn tại thì code tự nạp. Nếu cần tạo lại Homography Camera 2, mở chương trình chính và nhấn:
 
 ```text
 E
 ```
 
-Chương trình sử dụng các marker xuất hiện đồng thời trên cả Camera 1 và Camera 2. Các robot trong `ROBOT_IDS` không được dùng làm điểm calibration.
+Điều kiện để calibration Camera 2 trong lúc chạy:
 
-Cần tối thiểu:
+| Điều kiện | Giá trị |
+|---|---:|
+| Số frame thu | `60` |
+| Mẫu hợp lệ tối thiểu mỗi marker | `40` |
+| Số marker chung tối thiểu | `4` |
+| Marker robot bị loại khỏi calibration | `8`, `7`, `3`, `29` |
+
+## 8. Chụp ảnh và calib camera
+
+Chụp ảnh bàn cờ Camera 1:
+
+```bash
+python get_image.py
+```
+
+Chụp ảnh bàn cờ Camera 2:
+
+```bash
+python get_image2.py
+```
+
+Trong cửa sổ camera:
 
 ```text
-4 marker chung
+S   Chụp ảnh
+ESC Thoát
 ```
 
-Các kiểm tra hiện có:
+Calib Camera 1:
 
-```python
-RANSAC_REPROJ_THRESHOLD_CM = 2.0
-MIN_INLIER_RATIO = 0.75
-MAX_HOMOGRAPHY_RMSE_CM = 2.0
-MIN_SINGULAR_GAP = 1.2
+```bash
+python calib_and_save_values.py
 ```
 
-Pipeline hiệu chuẩn gồm:
+Calib Camera 2:
+
+```bash
+python calib_and_save_values2.py
+```
+
+Camera 2 sẽ lưu thêm các file kiểm tra:
 
 ```text
-common markers
-    ↓
-RANSAC
-    ↓
-inlier filtering
-    ↓
-reprojection error
-    ↓
-SVD / rank check
-    ↓
-Homography Camera 2
+calibration_report.txt
+per_view_reprojection_errors.csv
+rejected_images.csv
+corner_coverage.png
+undistort_examples/
 ```
 
----
+## 9. Dashboard
 
-## 9. Quy ước góc robot
+Dashboard OpenCV hiển thị:
 
 ```text
-0°   = +X
-90°  = +Y
-180° = -X
-270° = -Y
+Vị trí X, Y của 4 robot
+Góc A theo radian
+Camera đang được dùng cho từng robot
+Quỹ đạo robot
+Waypoint đã chấm
+Khoảng cách đã chạy
+Tốc độ
+Thời gian chạy
+Trạng thái ESP32 / Serial
+Event log
 ```
 
-Cạnh trên của ArUco được coi là hướng đầu robot.
+Các thao tác chính:
 
----
+| Phím / chuột | Chức năng |
+|---|---|
+| `Q` | Thoát |
+| `E` | Calib Homography Camera 2 |
+| `C` | Xóa path của cả 4 robot |
+| `+` / `-` | Zoom map |
+| `0` | Reset zoom |
+| `F` | Fit map |
+| `Enter` | Gửi waypoint của robot đang chọn |
+| `Backspace` | Xóa waypoint mới nhất |
+| `X` | Clear target của robot đang chọn |
+| Click trái trên map | Thêm waypoint |
+| Lăn chuột | Zoom map |
+| Kéo chuột phải | Pan map |
 
-## 10. Chuyển Camera 1 ↔ Camera 2
-
-Mỗi robot có candidate riêng từ hai camera.
-
-Khi cả hai camera cùng nhìn thấy robot, chương trình **giữ nguyên camera đang active**, không đổi qua lại từng frame.
-
-Chỉ chuyển camera khi nguồn hiện tại mất robot đủ:
-
-```python
-ROBOT_SWITCH_CONFIRM_FRAMES = 4
-```
-
-Ngưỡng chặn bước nhảy:
-
-```python
-ROBOT_MAX_JUMP_CM = 25.0
-```
-
-Lọc vị trí:
-
-```python
-ROBOT_POSITION_EMA_ALPHA = 0.45
-```
-
----
-
-## 11. Quỹ đạo robot
-
-Ngưỡng thêm điểm mới:
-
-```python
-ROBOT_PATH_MIN_STEP_CM = 0.8
-```
-
-Ngưỡng coi là bước nhảy lỗi:
-
-```python
-ROBOT_PATH_BREAK_STEP_CM = 18.0
-```
-
-Code dùng **path cache**. Đường cũ chỉ vẽ một lần, sau đó mỗi lần robot di chuyển chỉ vẽ thêm đoạn mới. Vì vậy quỹ đạo có thể dài mà không phải vẽ lại toàn bộ lịch sử mỗi frame.
-
----
-
-## 12. CLEAR PATH và CLEAR TARGET
-
-Hai chức năng này hoàn toàn khác nhau.
-
-### CLEAR PATH
-
-Các nút:
+Các nút trên dashboard:
 
 ```text
-R8 CLR PATH
-R7 CLR PATH
-R3 CLR PATH
-```
+R8 START / STOP / CLR PATH
+R7 START / STOP / CLR PATH
+R3 START / STOP / CLR PATH
+R29 START / STOP / CLR PATH
 
-Chức năng:
-
-- xóa quỹ đạo robot trên map;
-- reset DIST / SPEED;
-- không gửi `WPCLR#`;
-- không STOP robot;
-- không thay đổi trạng thái START/STOP;
-- không xóa danh sách target.
-
-Phím:
-
-```text
-C
-```
-
-xóa path của cả 3 robot.
-
-### CLEAR TARGET
-
-Nút:
-
-```text
-CLEAR TARGET
-```
-
-Chức năng:
-
-- xóa waypoint đang chấm của robot được chọn;
-- gửi `WPCLR#` tới đúng robot;
-- không xóa đường robot đã chạy.
-
-Ví dụ Robot 8:
-
-```text
-8;WPCLR#
-```
-
----
-
-## 13. Chọn nhiều điểm đích
-
-Chọn robot:
-
-```text
-R8 TARGET
-R7 TARGET
-R3 TARGET
-```
-
-Sau đó **click chuột trái** trên map để thêm waypoint.
-
-Ví dụ:
-
-```text
-P1 = (100.0, 80.0)
-P2 = (120.0, 60.0)
-P3 = (140.0, 80.0)
-```
-
-Điểm được lưu theo thứ tự:
-
-```text
-P1 -> P2 -> P3
-```
-
-Nút:
-
-```text
-UNDO
-```
-
-xóa waypoint vừa thêm gần nhất.
-
----
-
-## 14. Gửi waypoint bằng một packet
-
-Nhấn:
-
-```text
+R8 TARGET / R7 TARGET / R3 TARGET / R29 TARGET
 SEND 1 PACKET
+UNDO
+CLEAR TARGET
+CAM 1 VIEW
+CAM 2 VIEW
 ```
 
-Payload:
+## 10. START, STOP và CLEAR
 
-```text
-WPLIST;X1;Y1;X2;Y2;...;XN;YN#
-```
-
-Ví dụ:
-
-```text
-WPLIST;100.0;80.0;120.0;60.0;140.0;80.0#
-```
-
-Python thêm ID robot ở đầu.
-
-Robot 8:
-
-```text
-8;WPLIST;100.0;80.0;120.0;60.0;140.0;80.0#
-```
-
-Robot 7:
-
-```text
-7;WPLIST;200.0;80.0;220.0;60.0;240.0;80.0#
-```
-
-Robot 3:
-
-```text
-3;WPLIST;300.0;80.0;320.0;60.0;340.0;80.0#
-```
-
-Packet **không có trường số lượng waypoint**. Arduino Mega có thể đọc liên tục theo từng cặp:
-
-```text
-X1,Y1
-X2,Y2
-X3,Y3
-...
-```
-
-cho tới hết packet.
-
----
-
-## 15. Giới hạn waypoint packet
-
-Code hiện tại:
-
-```python
-ESPNOW_SAFE_WAYPOINT_BYTES = 240
-```
-
-Python kiểm tra kích thước trước khi gửi.
-
-Nếu payload vượt giới hạn cấu hình thì packet không được gửi.
-
-Nếu cần đường rất dài, có thể cân nhắc:
-
-- giảm số chữ số của tọa độ;
-- dùng binary thay text;
-- hoặc chia thành nhiều packet.
-
----
-
-## 16. Packet vị trí robot
-
-Format:
-
-```text
-ID;X;Y;ANGLE#
-```
-
-Ví dụ:
-
-```text
-8;352.4;64.7;43.2#
-7;420.8;80.1;271.6#
-3;500.2;40.0;90.0#
-```
-
-Python có thể nối liên tiếp:
-
-```text
-8;352.4;64.7;43.2#7;420.8;80.1;271.6#3;500.2;40.0;90.0#
-```
-
-Gateway cần tách theo dấu:
-
-```text
-#
-```
-
----
-
-## 17. START / STOP
-
-START:
+START gửi lệnh cho đúng robot và bật truyền tọa độ robot đó:
 
 ```text
 8;START#
 7;START#
 3;START#
+29;START#
 ```
 
-STOP:
+STOP gửi lệnh cho đúng robot và dừng truyền tọa độ robot đó:
 
 ```text
 8;STOP#
 7;STOP#
 3;STOP#
+29;STOP#
 ```
 
-Từng robot hoạt động độc lập.
+`CLEAR PATH` chỉ xóa quỹ đạo trên dashboard và reset distance/speed. Nó không gửi `STOP#`, không gửi `WPCLR#`, không xóa waypoint.
 
----
-
-## 18. Tần số truyền Serial
-
-```python
-TX_TARGET_HZ = 30.0
-```
-
-Serial chạy ở thread riêng so với vòng xử lý camera.
-
-Do đó:
+`CLEAR TARGET` xóa waypoint của robot đang chọn và gửi:
 
 ```text
-Vision FPS != Serial TX rate
+ID;WPCLR#
 ```
-
-Nếu vision chậm một nhịp, luồng Serial vẫn có thể gửi packet tọa độ mới nhất.
-
----
-
-## 19. Phím và chuột
-
-Phím:
-
-```text
-Q           Thoát
-E           Calibration Camera 2
-C           Clear path cả 3 robot
-+           Zoom in
--           Zoom out
-0           Reset zoom
-F           Fit map
-Enter       Send waypoint
-Backspace   Undo waypoint
-X           Clear target
-```
-
-Chuột:
-
-```text
-Left click      Add waypoint
-Mouse wheel     Zoom
-Right drag      Pan map
-```
-
----
-
-## 20. Camera Preview
-
-Dashboard có:
-
-```text
-CAM 1 VIEW
-CAM 2 VIEW
-```
-
-Preview chỉ được render khi bật, giúp giảm tải giao diện khi không cần xem camera.
-
----
-
-## 21. Chạy chương trình
-
-### Bước 1 - Kết nối
-
-Kết nối vào PC:
-
-```text
-Camera 1
-Camera 2
-ESP32 Gateway
-```
-
-### Bước 2 - Kiểm tra COM
-
-Mở Device Manager và tìm cổng của ESP32 Gateway.
-
-Sửa:
-
-```python
-com_port = 'COM19'
-```
-
-nếu cần.
-
-### Bước 3 - Cài thư viện
-
-```bash
-pip install numpy pyserial opencv-contrib-python
-```
-
-### Bước 4 - Chạy Python
 
 Ví dụ:
 
-```bash
-python realtime_aruco_detect.py
+```text
+8;WPCLR#
 ```
 
-hoặc chạy trong PyCharm.
+## 11. Giao thức Serial Python -> Gateway
 
----
+Mỗi packet kết thúc bằng dấu `#`.
 
-## 22. Quy trình test khuyến nghị
+Gateway tách packet theo `#`, đọc ID trước dấu `;` đầu tiên, rồi gửi phần payload còn lại qua ESP-NOW.
 
-### Test Camera
+### Pose packet
 
-Kiểm tra cả Camera 1 và Camera 2 có hoạt động.
-
-### Test ArUco
-
-Đặt lần lượt:
+Format:
 
 ```text
-ID8
-ID7
-ID3
+ID;X;Y;ANGLE_RAD#
 ```
 
-và kiểm tra dashboard nhận đúng.
+Trong đó:
 
-### Test tọa độ
+| Trường | Ý nghĩa | Format |
+|---|---|---|
+| `ID` | ID robot | số nguyên |
+| `X` | tọa độ X cm | 1 số sau dấu phẩy |
+| `Y` | tọa độ Y cm | 1 số sau dấu phẩy |
+| `ANGLE_RAD` | góc radian `[-pi, pi]` | 5 số sau dấu phẩy |
 
-Di chuyển robot và kiểm tra:
+Ví dụ:
 
 ```text
-X
-Y
-Angle
+8;352.4;64.7;0.75400#
+7;420.8;80.1;-1.54300#
+3;500.2;40.0;1.57080#
+29;510.0;60.0;3.14159#
 ```
 
-### Test overlap
-
-Cho robot đi:
+Một lần gửi có thể nối nhiều packet liên tiếp:
 
 ```text
-Camera 1
-   ↓
-Overlap
-   ↓
-Camera 2
+8;352.4;64.7;0.75400#7;420.8;80.1;-1.54300#3;500.2;40.0;1.57080#29;510.0;60.0;3.14159#
 ```
 
-Kiểm tra tọa độ không nhảy bất thường.
+### Waypoint packet
 
-### Test Serial
-
-Nhấn START từng robot và kiểm tra Gateway nhận:
+Format:
 
 ```text
-ID;X;Y;ANGLE#
+ID;WPLIST;X1;Y1;X2;Y2;...;XN;YN#
 ```
 
-### Test Waypoint
-
-Chọn robot, click vài điểm rồi:
+Ví dụ:
 
 ```text
-SEND 1 PACKET
+8;WPLIST;100.0;80.0;120.0;60.0;140.0;80.0#
 ```
 
-Kiểm tra Receiver / Mega nhận `WPLIST`.
+Packet waypoint không có trường số lượng điểm. Bên nhận cần đọc lần lượt theo cặp `X, Y` cho tới hết packet.
 
-### Test CLEAR
-
-Kiểm tra riêng:
-
-```text
-CLR PATH
-```
-
-và:
-
-```text
-CLEAR TARGET
-```
-
-Hai nút không được ảnh hưởng lẫn nhau.
-
----
-
-## 23. Cấu trúc repository GitHub khuyến nghị
-
-```text
-robot-tracking-project/
-│
-├── python/
-│   └── realtime_aruco_detect.py
-│
-├── esp32_gateway/
-│   └── ESP32_gateway.ino
-│
-├── esp32_receiver/
-│   └── ESP32_receiver.ino
-│
-├── arduino_mega/
-│   └── ArduinoMega.ino
-│
-├── calib_values2/
-│   └── homography_cam2_to_real.pkl
-│
-├── requirements.txt
-├── .gitignore
-└── README.md
-```
-
----
-
-## 24. `.gitignore` khuyến nghị
-
-```gitignore
-__pycache__/
-*.pyc
-.idea/
-.vscode/
-venv/
-.venv/
-
-# Nếu muốn người dùng tự calibration:
-calib_values2/*.pkl
-```
-
----
-
-## 25. Troubleshooting
-
-### Không có `cv2.aruco`
-
-Cài:
-
-```bash
-pip uninstall opencv-python opencv-contrib-python -y
-pip install opencv-contrib-python
-```
-
-### Không kết nối được ESP32
-
-Kiểm tra:
-
-- COM có đúng không;
-- ESP32 đã kết nối USB chưa;
-- Arduino Serial Monitor có đang giữ COM không;
-- baud rate có phải `115200` không.
-
-### Không mở được camera
-
-Thử các index:
-
-```python
-CameraStream(0)
-CameraStream(1)
-CameraStream(2)
-CameraStream(3)
-```
-
-### Camera 2 cho tọa độ sai
-
-Nhấn:
-
-```text
-E
-```
-
-để calibration lại và đảm bảo có ít nhất 4 marker chung phân bố đủ rộng.
-
-### Waypoint không gửi
-
-Kiểm tra số waypoint và kích thước payload.
-
-Giới hạn hiện tại:
+Python kiểm tra kích thước payload trước khi gửi:
 
 ```python
 ESPNOW_SAFE_WAYPOINT_BYTES = 240
 ```
 
----
+## 12. ESP32 Gateway
 
-## 26. Tóm tắt giao thức
+File:
 
-| Chức năng | Ví dụ |
+```text
+Ardunoide/ESP32gui/ESP32/ESP32.ino
+```
+
+Nhiệm vụ:
+
+```text
+Đọc Serial từ Python
+Tách packet bằng dấu #
+Đọc ID robot
+Chọn MAC tương ứng
+Bỏ ID khỏi packet
+Gửi payload qua ESP-NOW
+```
+
+Gateway đang cấu hình ESP-NOW channel:
+
+```cpp
+#define ESPNOW_CHANNEL 1
+```
+
+Baud rate:
+
+```cpp
+Serial.begin(115200);
+```
+
+Khi đổi board robot, cần cập nhật MAC tại:
+
+```cpp
+robot8Mac
+robot7Mac
+robot3Mac
+robot29Mac
+```
+
+## 13. ESP32 Receiver
+
+File:
+
+```text
+Ardunoide/ESP32nhan/ESP8266/ESP8266.ino
+```
+
+Receiver hiện xử lý:
+
+```text
+START#
+STOP#
+X;Y;ANGLE_RAD#
+```
+
+Khi nhận pose hợp lệ, receiver lưu:
+
+```cpp
+robotX
+robotY
+robotAngle
+```
+
+Sau đó in ra Serial:
+
+```text
+X = 352.4 | Y = 64.7 | ANGLE = 0.75400 rad
+```
+
+Chỗ cần thêm thuật toán điều khiển motor nằm trong `loop()`:
+
+```cpp
+// DAT THUAT TOAN DIEU KHIEN MOTOR CUA ROBOT TAI DAY.
+// x, y, angle DEU LA FLOAT.
+```
+
+Lưu ý hiện tại: receiver chưa có logic xử lý `WPLIST` và `WPCLR`. Gateway đã route được các packet này, nhưng code receiver cần được bổ sung nếu robot phải chạy theo waypoint.
+
+## 14. Luồng hợp nhất 2 camera
+
+Mỗi robot có candidate riêng từ Camera 1 và Camera 2. Khi cả hai camera đều nhìn thấy cùng robot, code giữ nguyên camera đang active để tránh vị trí bị nhảy qua lại.
+
+Các tham số liên quan:
+
+```python
+ROBOT_SWITCH_CONFIRM_FRAMES = 4
+ROBOT_MAX_JUMP_CM = 25.0
+ROBOT_POSITION_EMA_ALPHA = 0.45
+ROBOT_PATH_MIN_STEP_CM = 0.8
+ROBOT_PATH_BREAK_STEP_CM = 18.0
+ROBOT_LOST_HIDE_FRAMES = 12
+ROBOT_LOST_RESET_FRAMES = 20
+```
+
+Ý nghĩa:
+
+| Tham số | Chức năng |
 |---|---|
-| START Robot 8 | `8;START#` |
-| STOP Robot 8 | `8;STOP#` |
-| Pose Robot 8 | `8;352.4;64.7;43.2#` |
-| Waypoint Robot 8 | `8;WPLIST;100.0;80.0;120.0;60.0#` |
-| Clear Target Robot 8 | `8;WPCLR#` |
+| `ROBOT_SWITCH_CONFIRM_FRAMES` | Camera active mất robot đủ số frame này mới chuyển sang camera kia |
+| `ROBOT_MAX_JUMP_CM` | Bỏ qua phép đo nhảy quá xa |
+| `ROBOT_POSITION_EMA_ALPHA` | Hệ số lọc mượt vị trí |
+| `ROBOT_PATH_MIN_STEP_CM` | Robot đi quá ngưỡng này mới thêm điểm vào path |
+| `ROBOT_PATH_BREAK_STEP_CM` | Nếu nhảy quá xa thì ngắt path, không nối đường |
 
-Robot 7 và Robot 3 sử dụng cùng format, chỉ thay ID đầu packet.
+## 15. Quy trình test đề xuất
 
----
-
-## 27. Công nghệ
-
-- Python
-- OpenCV
-- OpenCV ArUco
-- NumPy
-- PySerial
-- Homography
-- RANSAC
-- SVD
-- ESP32
-- ESP-NOW
-- UART
-- Arduino Mega
-
----
-
-## 28. License
-
-Nếu muốn người khác được phép sử dụng, chỉnh sửa và phân phối code, có thể thêm:
+Test camera:
 
 ```text
-MIT License
+Mở chương trình chính
+Bật CAM 1 VIEW và CAM 2 VIEW
+Kiểm tra cả hai camera có hình
 ```
 
-Nếu đồ án chưa hoàn thành hoặc chưa muốn công khai, có thể để repository ở chế độ **Private** trước.
-
----
-
-## 29. Author
-
-Điền thông tin nhóm tại đây:
+Test ArUco:
 
 ```text
-Author:
-University:
-Project:
-Contact:
+Đặt marker ID 8, 7, 3, 29 vào vùng nhìn
+Kiểm tra dashboard hiện đúng robot
 ```
+
+Test tọa độ và góc:
+
+```text
+Di chuyển robot trên map
+Kiểm tra X, Y thay đổi theo cm
+Xoay robot
+Kiểm tra A thay đổi theo radian [-pi, pi]
+```
+
+Test Serial:
+
+```text
+Kết nối ESP32 Gateway
+Nhấn START từng robot
+Kiểm tra gateway/receiver nhận packet đúng ID
+```
+
+Test overlap:
+
+```text
+Cho robot đi từ vùng Camera 1 sang vùng Camera 2
+Kiểm tra tọa độ không bị nhảy lớn ở vùng giao
+```
+
+Test waypoint:
+
+```text
+Chọn R8 TARGET hoặc robot khác
+Click nhiều điểm trên map
+Nhấn SEND 1 PACKET
+Kiểm tra gateway route WPLIST đúng robot
+```
+
+## 16. Lỗi thường gặp
+
+Không mở được camera:
+
+```text
+Thử đổi index CameraStream(0), CameraStream(1), CameraStream(2), CameraStream(3)
+Kiểm tra camera có đang bị phần mềm khác giữ không
+```
+
+Không kết nối được ESP32:
+
+```text
+Kiểm tra COM port trong Device Manager
+Đóng Arduino Serial Monitor nếu đang mở cùng COM
+Đảm bảo baud rate Python và Gateway đều là 115200
+```
+
+Camera 2 cho tọa độ sai:
+
+```text
+Kiểm tra các file trong calib_values2_new/
+Nhấn E để calib lại Homography Camera 2
+Đảm bảo có ít nhất 4 marker chung giữa 2 camera, không dùng ID robot
+```
+
+Góc sai hoặc ngược hướng:
+
+```text
+Kiểm tra marker ArUco có được dán đúng chiều trên robot không
+Code coi cạnh trên của marker là đầu robot
+```
+
+Waypoint không chạy trên robot:
+
+```text
+Gateway đã gửi được WPLIST/WPCLR
+Receiver hiện chưa xử lý WPLIST/WPCLR
+Cần thêm parser waypoint và thuật toán điều khiển motor trong ESP32 receiver hoặc Arduino Mega
+```
+
+## 17. Các file nên chạy
+
+| Mục đích | Lệnh |
+|---|---|
+| Chạy hệ thống chính | `python realtime_aruco_detect.py` |
+| Chụp ảnh calib Cam 1 | `python get_image.py` |
+| Chụp ảnh calib Cam 2 | `python get_image2.py` |
+| Calib Cam 1 | `python calib_and_save_values.py` |
+| Calib Cam 2 | `python calib_and_save_values2.py` |
+| Test gửi Serial giả lập | `python send_data.py` |
+| Test Cam2 raw vs undistort | `python test.py` |
+
+## 18. Ghi chú phát triển
+
+Một số điểm nên cải thiện nếu tiếp tục phát triển:
+
+```text
+Tách cấu hình robot/camera/serial ra file config riêng
+Gom logic xử lý 4 robot thành class để giảm lặp code
+Thêm parser WPLIST/WPCLR cho ESP32 receiver
+Thêm thuật toán điều khiển motor
+Thêm requirements.txt
+Đổi tên thư mục Ardunoide và ESP8266 cho đúng nội dung ESP32
+```
+
